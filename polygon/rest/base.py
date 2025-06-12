@@ -10,7 +10,7 @@ from importlib.metadata import version, PackageNotFoundError
 from .models.request import RequestOptionBuilder
 from ..logging import get_logger
 import logging
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 from ..exceptions import AuthError, BadResponse
 
 logger = get_logger("RESTClient")
@@ -207,6 +207,10 @@ class BaseClient:
         result_key: str = "results",
         options: Optional[RequestOptionBuilder] = None,
     ):
+        max_items_to_return = None
+        if "limit" in params:
+            max_items_to_return = params["limit"]
+        returned_items = 0
         while True:
             resp = self._get(
                 path=path,
@@ -226,9 +230,17 @@ class BaseClient:
             if result_key not in decoded:
                 return []
             for t in decoded[result_key]:
+                if max_items_to_return and returned_items == max_items_to_return:
+                    return
+                returned_items += 1
                 yield deserializer(t)
+
             if "next_url" in decoded:
-                path = decoded["next_url"].replace(self.BASE, "")
+                next_url = decoded["next_url"]
+                parsed = urlparse(next_url)
+                path = parsed.path
+                if parsed.query:
+                    path += "?" + parsed.query
                 params = {}
             else:
                 return
