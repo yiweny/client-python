@@ -327,12 +327,12 @@ class BaseClient:
             lte_param = f"{base_param}.lte"
             lt_param = f"{base_param}.lt"
 
-            # Only add time gate if the base param or related params are being used
-            # and no upper bound is already set
+            # Check if related params are being used
             has_related_param = any(
                 k == base_param or k.startswith(f"{base_param}.") for k in params.keys()
             )
 
+            # Add time gate if related params are used and no upper bound exists
             if has_related_param and lte_param not in params and lt_param not in params:
                 # Add time gate as upper bound
                 # Use date format for date-based params, timestamp for timestamp-based
@@ -342,6 +342,13 @@ class BaseClient:
                     )
                 else:
                     params[lte_param] = self.time_gate.strftime("%Y-%m-%d")
+
+        # Always add timestamp.lte if time gate is set and no timestamp upper bound exists
+        # This ensures the time gate is applied even when no timestamp params are specified
+        if "timestamp.lte" not in params and "timestamp.lt" not in params:
+            params["timestamp.lte"] = int(
+                self.time_gate.timestamp() * self.time_mult(datetime_res)
+            )
 
         return params
 
