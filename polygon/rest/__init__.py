@@ -17,7 +17,7 @@ from .vX import VXClient
 from typing import Optional, Any
 import os
 
-BASE = "https://api.polygon.io"
+BASE = os.getenv("POLYGON_API_BASE_URL", "https://api.polygon.io")
 ENV_KEY = "POLYGON_API_KEY"
 
 

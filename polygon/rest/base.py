@@ -2,16 +2,19 @@ import certifi
 import json
 import urllib3
 import inspect
+import os
 from urllib3.util.retry import Retry
 from enum import Enum
-from typing import Optional, Any, Dict
-from datetime import datetime
+from typing import Optional, Any, Dict, Union
+from datetime import datetime, date
 from importlib.metadata import version, PackageNotFoundError
 from .models.request import RequestOptionBuilder
 from ..logging import get_logger
 import logging
 from urllib.parse import urlencode, urlparse
 from ..exceptions import AuthError, BadResponse
+
+TIME_GATE_ENV = "TIME_GATE"
 
 logger = get_logger("RESTClient")
 version_number = "unknown"
@@ -41,6 +44,9 @@ class BaseClient:
 
         self.API_KEY = api_key
         self.BASE = base
+
+        # Parse TIME_GATE environment variable
+        self.time_gate = self._parse_time_gate(os.getenv(TIME_GATE_ENV))
 
         self.headers = {
             "Authorization": "Bearer " + self.API_KEY,
@@ -85,6 +91,43 @@ class BaseClient:
             self.json = custom_json
         else:
             self.json = json
+
+    @staticmethod
+    def _parse_time_gate(time_gate_str: Optional[str]) -> Optional[datetime]:
+        """
+        Parse the TIME_GATE environment variable value.
+        Supports:
+        - ISO date string: "2023-01-01"
+        - ISO datetime string: "2023-01-01T12:00:00"
+        - Unix timestamp in seconds or milliseconds
+        Returns None if the value is empty or None.
+        """
+        if not time_gate_str:
+            return None
+
+        time_gate_str = time_gate_str.strip()
+        if not time_gate_str:
+            return None
+
+        # Try parsing as ISO format first
+        for fmt in ["%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%d"]:
+            try:
+                return datetime.strptime(time_gate_str, fmt)
+            except ValueError:
+                continue
+
+        # Try parsing as Unix timestamp
+        try:
+            ts = int(time_gate_str)
+            # If the timestamp is large (> year 2100 in seconds), assume milliseconds
+            if ts > 4102444800:  # Year 2100 in seconds
+                ts = ts // 1000
+            return datetime.fromtimestamp(ts)
+        except (ValueError, OSError):
+            pass
+
+        logger.warning(f"Could not parse TIME_GATE value: {time_gate_str}")
+        return None
 
     def _decode(self, resp):
         return self.json.loads(resp.data.decode("utf-8"))
@@ -161,6 +204,147 @@ class BaseClient:
 
         return 1
 
+    def _apply_time_gate_to_value(
+        self,
+        value: Union[str, int, datetime, date, None],
+        datetime_res: str = "nanos",
+    ) -> Union[str, int, datetime, date, None]:
+        """
+        Apply time gate to a single timestamp/date value.
+        Returns the minimum of the value and time_gate.
+        """
+        if self.time_gate is None or value is None:
+            return value
+
+        # Convert value to datetime for comparison
+        value_dt = None
+        if isinstance(value, datetime):
+            value_dt = value
+        elif isinstance(value, date):
+            value_dt = datetime.combine(value, datetime.min.time())
+        elif isinstance(value, int):
+            # Assume it's a Unix timestamp, normalize to seconds
+            divisor = self.time_mult(datetime_res)
+            value_dt = datetime.fromtimestamp(value / divisor)
+        elif isinstance(value, str):
+            # Try to parse as date string
+            for fmt in ["%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%d"]:
+                try:
+                    value_dt = datetime.strptime(value, fmt)
+                    break
+                except ValueError:
+                    continue
+
+        if value_dt is None:
+            # Could not parse, return original value
+            return value
+
+        # Return the minimum of value and time_gate
+        if value_dt > self.time_gate:
+            # Return time_gate in the same format as the original value
+            if isinstance(value, datetime):
+                return self.time_gate
+            elif isinstance(value, date):
+                return self.time_gate.date()
+            elif isinstance(value, int):
+                return int(self.time_gate.timestamp() * self.time_mult(datetime_res))
+            elif isinstance(value, str):
+                # Return as the same string format
+                if "T" in value:
+                    return self.time_gate.strftime("%Y-%m-%dT%H:%M:%S")
+                else:
+                    return self.time_gate.strftime("%Y-%m-%d")
+
+        return value
+
+    def _apply_time_gate_to_params(
+        self, params: Dict[str, Any], datetime_res: str = "nanos"
+    ) -> Dict[str, Any]:
+        """
+        Apply time gate to query parameters.
+        This caps timestamp.lte, timestamp.lt, and similar date parameters at the time gate.
+        If no upper bound is set, adds timestamp.lte = time_gate.
+        """
+        if self.time_gate is None:
+            return params
+
+        # Parameters that represent upper time bounds (less than or equal)
+        upper_bound_params = [
+            "timestamp.lte",
+            "timestamp.lt",
+            "published_utc.lte",
+            "published_utc.lt",
+            "filing_date.lte",
+            "filing_date.lt",
+            "period_of_report_date.lte",
+            "period_of_report_date.lt",
+            "execution_date.lte",
+            "execution_date.lt",
+            "ex_dividend_date.lte",
+            "ex_dividend_date.lt",
+            "record_date.lte",
+            "record_date.lt",
+            "declaration_date.lte",
+            "declaration_date.lt",
+            "pay_date.lte",
+            "pay_date.lt",
+            "expiration_date.lte",
+            "expiration_date.lt",
+            "settlement_date.lte",
+            "settlement_date.lt",
+            "date.lte",
+            "date.lt",
+            "listing_date.lte",
+            "listing_date.lt",
+        ]
+
+        # Base names for timestamp parameters (we'll add .lte if no upper bound exists)
+        timestamp_base_params = [
+            "timestamp",
+            "published_utc",
+            "filing_date",
+            "period_of_report_date",
+            "execution_date",
+            "ex_dividend_date",
+            "record_date",
+            "declaration_date",
+            "pay_date",
+            "expiration_date",
+            "settlement_date",
+            "date",
+            "listing_date",
+        ]
+
+        # Cap existing upper bound parameters
+        for param in upper_bound_params:
+            if param in params:
+                params[param] = self._apply_time_gate_to_value(
+                    params[param], datetime_res
+                )
+
+        # For each base param, if there's no upper bound set, add one
+        for base_param in timestamp_base_params:
+            lte_param = f"{base_param}.lte"
+            lt_param = f"{base_param}.lt"
+
+            # Only add time gate if the base param or related params are being used
+            # and no upper bound is already set
+            has_related_param = any(
+                k == base_param or k.startswith(f"{base_param}.") for k in params.keys()
+            )
+
+            if has_related_param and lte_param not in params and lt_param not in params:
+                # Add time gate as upper bound
+                # Use date format for date-based params, timestamp for timestamp-based
+                if base_param == "timestamp":
+                    params[lte_param] = int(
+                        self.time_gate.timestamp() * self.time_mult(datetime_res)
+                    )
+                else:
+                    params[lte_param] = self.time_gate.strftime("%Y-%m-%d")
+
+        return params
+
     def _get_params(
         self, fn, caller_locals: Dict[str, Any], datetime_res: str = "nanos"
     ):
@@ -192,6 +376,9 @@ class BaseClient:
                         val = ",".join(val)
                     params[argname] = val
 
+        # Apply time gate to parameters
+        params = self._apply_time_gate_to_params(params, datetime_res)
+
         return params
 
     def _concat_headers(self, headers: Optional[Dict[str, str]]) -> Dict[str, str]:
@@ -208,8 +395,8 @@ class BaseClient:
         options: Optional[RequestOptionBuilder] = None,
     ):
         max_items_to_return = None
-        if "limit" in params:
-            max_items_to_return = params["limit"]
+        if "max_num_to_return" in params:
+            max_items_to_return = params["max_num_to_return"]
         returned_items = 0
         while True:
             resp = self._get(
