@@ -31,6 +31,7 @@ class QuotesClient(BaseClient):
         params: Optional[Dict[str, Any]] = None,
         raw: bool = False,
         options: Optional[RequestOptionBuilder] = None,
+        max_num_to_return: Optional[int] = 50000,
     ) -> Union[Iterator[Quote], HTTPResponse]:
         """
         Get quotes for a ticker symbol in a given time range.
@@ -46,6 +47,7 @@ class QuotesClient(BaseClient):
         :param order: Order results based on the sort field.
         :param params: Any additional query params.
         :param raw: Return HTTPResponse object instead of results object.
+        :param max_num_to_return: Maximum number of quotes to return, default is 50000.
         :return: List of quotes
         """
         url = f"/v3/quotes/{ticker}"

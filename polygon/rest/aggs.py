@@ -8,6 +8,55 @@ from .models.request import RequestOptionBuilder
 
 
 class AggsClient(BaseClient):
+    def _apply_time_gate_to_agg_date(
+        self, value: Union[str, int, datetime, date]
+    ) -> Union[str, int, datetime, date]:
+        """
+        Apply time gate to aggregate endpoint date parameters (from_, to).
+        These are in the URL path, not query params.
+        """
+        if self.time_gate is None:
+            return value
+
+        # Convert to datetime for comparison
+        value_dt = None
+        original_type = type(value)
+
+        if isinstance(value, datetime):
+            value_dt = value
+        elif isinstance(value, date):
+            value_dt = datetime.combine(value, datetime.min.time())
+        elif isinstance(value, int):
+            # Unix milliseconds timestamp
+            value_dt = datetime.fromtimestamp(value / 1000)
+        elif isinstance(value, str):
+            # Try to parse as date string
+            for fmt in ["%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%d"]:
+                try:
+                    value_dt = datetime.strptime(value, fmt)
+                    break
+                except ValueError:
+                    continue
+
+        if value_dt is None:
+            return value
+
+        # Cap at time_gate
+        if value_dt > self.time_gate:
+            if original_type == datetime:
+                return self.time_gate
+            elif original_type == date:
+                return self.time_gate.date()
+            elif original_type == int:
+                return int(self.time_gate.timestamp() * 1000)
+            elif original_type == str:
+                if "T" in value:
+                    return self.time_gate.strftime("%Y-%m-%dT%H:%M:%S")
+                else:
+                    return self.time_gate.strftime("%Y-%m-%d")
+
+        return value
+
     def list_aggs(
         self,
         ticker: str,
@@ -38,6 +87,9 @@ class AggsClient(BaseClient):
         :param raw: Return raw object instead of results object
         :return: Iterator of aggregates
         """
+        # Apply time gate to 'to' parameter
+        to = self._apply_time_gate_to_agg_date(to)
+
         if isinstance(from_, datetime):
             from_ = int(from_.timestamp() * self.time_mult("millis"))
 
@@ -83,6 +135,9 @@ class AggsClient(BaseClient):
         :param raw: Return raw object instead of results object
         :return: List of aggregates
         """
+        # Apply time gate to 'to' parameter
+        to = self._apply_time_gate_to_agg_date(to)
+
         if isinstance(from_, datetime):
             from_ = int(from_.timestamp() * self.time_mult("millis"))
 
@@ -121,6 +176,9 @@ class AggsClient(BaseClient):
         :param raw: Return raw object instead of results object
         :return: List of grouped daily aggregates
         """
+        # Apply time gate to date parameter
+        date = self._apply_time_gate_to_agg_date(date)
+
         url = f"/v2/aggs/grouped/locale/{locale}/market/{market_type}/{date}"
 
         return self._get(
@@ -151,6 +209,9 @@ class AggsClient(BaseClient):
         :param raw: Return raw object instead of results object
         :return: Daily open close aggregate
         """
+        # Apply time gate to date parameter
+        date = self._apply_time_gate_to_agg_date(date)
+
         url = f"/v1/open-close/{ticker}/{date}"
 
         return self._get(
