@@ -90,6 +90,12 @@ class AggsClient(BaseClient):
         # Apply time gate to 'to' parameter
         to = self._apply_time_gate_to_agg_date(to)
 
+        # Force unadjusted data when time-gated so prices reflect what
+        # was actually observable at that point in time (no retroactive
+        # split/dividend adjustments).
+        if self.time_gate is not None:
+            adjusted = False
+
         if isinstance(from_, datetime):
             from_ = int(from_.timestamp() * self.time_mult("millis"))
 
@@ -138,6 +144,12 @@ class AggsClient(BaseClient):
         # Apply time gate to 'to' parameter
         to = self._apply_time_gate_to_agg_date(to)
 
+        # Force unadjusted data when time-gated so prices reflect what
+        # was actually observable at that point in time (no retroactive
+        # split/dividend adjustments).
+        if self.time_gate is not None:
+            adjusted = False
+
         if isinstance(from_, datetime):
             from_ = int(from_.timestamp() * self.time_mult("millis"))
 
@@ -179,6 +191,11 @@ class AggsClient(BaseClient):
         # Apply time gate to date parameter
         date = self._apply_time_gate_to_agg_date(date)
 
+        # Force unadjusted data when time-gated so prices reflect what
+        # was actually observable at that point in time.
+        if self.time_gate is not None:
+            adjusted = False
+
         url = f"/v2/aggs/grouped/locale/{locale}/market/{market_type}/{date}"
 
         return self._get(
@@ -212,6 +229,11 @@ class AggsClient(BaseClient):
         # Apply time gate to date parameter
         date = self._apply_time_gate_to_agg_date(date)
 
+        # Force unadjusted data when time-gated so prices reflect what
+        # was actually observable at that point in time.
+        if self.time_gate is not None:
+            adjusted = False
+
         url = f"/v1/open-close/{ticker}/{date}"
 
         return self._get(
@@ -239,6 +261,11 @@ class AggsClient(BaseClient):
         :param raw: Return raw object instead of results object
         :return: Previous close aggregate
         """
+        # Block when time-gating is enabled since this endpoint always
+        # returns the most recent previous day's data (live).
+        if self.time_gate is not None:
+            return []
+
         url = f"/v2/aggs/ticker/{ticker}/prev"
 
         return self._get(

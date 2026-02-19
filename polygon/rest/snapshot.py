@@ -62,6 +62,8 @@ class SnapshotClient(BaseClient):
         :param options: request options
         :return: list of Snapshots
         """
+        if self.time_gate is not None:
+            return []
         url = f"/v3/snapshot"
         return self._paginate(
             path=url,
@@ -91,6 +93,8 @@ class SnapshotClient(BaseClient):
         :param include_otc: Include OTC securities in the response. Default is false (don't include OTC securities).
         :return: List of Snapshots
         """
+        if self.time_gate is not None:
+            return []
         locale = get_locale(market_type)
         url = f"/v2/snapshot/locale/{locale}/markets/{market_type}/tickers"
         if type(tickers) is list:
@@ -125,6 +129,8 @@ class SnapshotClient(BaseClient):
         :param include_otc: Include OTC securities in the response. Default is false (don't include OTC securities).
         :return: List of Snapshots
         """
+        if self.time_gate is not None:
+            return []
         locale = get_locale(market_type)
         url = f"/v2/snapshot/locale/{locale}/markets/{market_type}/{direction}"
         return self._get(
@@ -153,6 +159,8 @@ class SnapshotClient(BaseClient):
         :param ticker: The ticker symbol.
         :return: List of Snapshots
         """
+        if self.time_gate is not None:
+            return []
         locale = get_locale(market_type)
         url = f"/v2/snapshot/locale/{locale}/markets/{market_type}/tickers/{ticker}"
         return self._get(
@@ -179,6 +187,8 @@ class SnapshotClient(BaseClient):
         :param option_contract: The option contract identifier.
         :return: List of Snapshots
         """
+        if self.time_gate is not None:
+            return []
         url = f"/v3/snapshot/options/{underlying_asset}/{option_contract}"
         return self._get(
             path=url,
@@ -202,6 +212,8 @@ class SnapshotClient(BaseClient):
         :param underlying_asset: The underlying ticker symbol of the option contract.
         :return: List of Snapshots
         """
+        if self.time_gate is not None:
+            return []
         url = f"/v3/snapshot/options/{underlying_asset}"
         return self._paginate(
             path=url,
@@ -227,6 +239,8 @@ class SnapshotClient(BaseClient):
         :param ticker: The ticker symbol.
         :return: List of Snapshots
         """
+        if self.time_gate is not None:
+            return []
         url = f"/v2/snapshot/locale/global/markets/crypto/tickers/{ticker}/book"
         return self._get(
             path=url,
@@ -244,6 +258,8 @@ class SnapshotClient(BaseClient):
         raw: bool = False,
         options: Optional[RequestOptionBuilder] = None,
     ) -> Union[List[IndicesSnapshot], HTTPResponse]:
+        if self.time_gate is not None:
+            return []
         url = f"/v3/snapshot/indices"
 
         return self._get(

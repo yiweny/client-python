@@ -322,33 +322,31 @@ class BaseClient:
                     params[param], datetime_res
                 )
 
-        # For each base param, if there's no upper bound set, add one
+        # Cap plain date/timestamp params (e.g. "date", "as_of") that are
+        # passed as exact values rather than as .lte/.lt range filters.
+        plain_date_params = timestamp_base_params + ["as_of"]
+        for param in plain_date_params:
+            if param in params:
+                params[param] = self._apply_time_gate_to_value(
+                    params[param], datetime_res
+                )
+
+        # For each base param, always inject an upper bound (.lte) if none
+        # exists. This ensures the time gate is enforced even when the caller
+        # omits date filters entirely (e.g. list_splits(ticker="AAPL")
+        # without an execution_date filter).
         for base_param in timestamp_base_params:
             lte_param = f"{base_param}.lte"
             lt_param = f"{base_param}.lt"
 
-            # Check if related params are being used
-            has_related_param = any(
-                k == base_param or k.startswith(f"{base_param}.") for k in params.keys()
-            )
-
-            # Add time gate if related params are used and no upper bound exists
-            if has_related_param and lte_param not in params and lt_param not in params:
-                # Add time gate as upper bound
-                # Use date format for date-based params, timestamp for timestamp-based
+            if lte_param not in params and lt_param not in params:
+                # Use date format for date-based params, nanos int for timestamp
                 if base_param == "timestamp":
                     params[lte_param] = int(
                         self.time_gate.timestamp() * self.time_mult(datetime_res)
                     )
                 else:
                     params[lte_param] = self.time_gate.strftime("%Y-%m-%d")
-
-        # Always add timestamp.lte if time gate is set and no timestamp upper bound exists
-        # This ensures the time gate is applied even when no timestamp params are specified
-        if "timestamp.lte" not in params and "timestamp.lt" not in params:
-            params["timestamp.lte"] = int(
-                self.time_gate.timestamp() * self.time_mult(datetime_res)
-            )
 
         return params
 

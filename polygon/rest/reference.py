@@ -43,6 +43,11 @@ class MarketsClient(BaseClient):
         :param raw: Return HTTPResponse object instead of results object.
         :return: List of market holidays.
         """
+        # Block when time-gating is enabled since this endpoint returns
+        # forward-looking data that could leak future information.
+        if self.time_gate is not None:
+            return []
+
         url = "/v1/marketstatus/upcoming"
 
         return self._get(
@@ -63,6 +68,11 @@ class MarketsClient(BaseClient):
         :param raw: Return HTTPResponse object instead of results object.
         :return: Market status.
         """
+        # Block when time-gating is enabled since this endpoint returns
+        # live data that could leak current market state.
+        if self.time_gate is not None:
+            return []
+
         url = "/v1/marketstatus/now"
 
         return self._get(

@@ -58,6 +58,10 @@ class IndicatorsClient(BaseClient):
         :param raw: Return raw object instead of results object
         :return: SingleIndicatorResults
         """
+        # Force unadjusted data when time-gated so prices reflect what
+        # was actually observable at that point in time.
+        if self.time_gate is not None:
+            adjusted = False
 
         url = f"/v1/indicators/sma/{ticker}"
 
@@ -113,6 +117,10 @@ class IndicatorsClient(BaseClient):
         :param raw: Return raw object instead of results object
         :return: SingleIndicatorResults
         """
+        # Force unadjusted data when time-gated so prices reflect what
+        # was actually observable at that point in time.
+        if self.time_gate is not None:
+            adjusted = False
 
         url = f"/v1/indicators/ema/{ticker}"
 
@@ -168,6 +176,10 @@ class IndicatorsClient(BaseClient):
         :param raw: Return raw object instead of results object
         :return: SingleIndicatorResults
         """
+        # Force unadjusted data when time-gated so prices reflect what
+        # was actually observable at that point in time.
+        if self.time_gate is not None:
+            adjusted = False
 
         url = f"/v1/indicators/rsi/{ticker}"
 
@@ -226,6 +238,10 @@ class IndicatorsClient(BaseClient):
         :param raw: Return raw object instead of results object
         :return: MACDIndicatorResults
         """
+        # Force unadjusted data when time-gated so prices reflect what
+        # was actually observable at that point in time.
+        if self.time_gate is not None:
+            adjusted = False
 
         url = f"/v1/indicators/macd/{ticker}"
 

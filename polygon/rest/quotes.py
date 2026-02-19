@@ -75,6 +75,11 @@ class QuotesClient(BaseClient):
         :param raw: Return HTTPResponse object instead of results object.
         :return: Last Quote
         """
+        # Block when time-gating is enabled since this endpoint returns
+        # live data that could leak current market state.
+        if self.time_gate is not None:
+            return []
+
         url = f"/v2/last/nbbo/{ticker}"
 
         return self._get(
@@ -103,6 +108,11 @@ class QuotesClient(BaseClient):
         :param raw: Return HTTPResponse object instead of results object.
         :return: Last Forex Quote
         """
+        # Block when time-gating is enabled since this endpoint returns
+        # live data that could leak current market state.
+        if self.time_gate is not None:
+            return []
+
         url = f"/v1/last_quote/currencies/{from_}/{to}"
 
         return self._get(
@@ -134,6 +144,11 @@ class QuotesClient(BaseClient):
         :param raw: Return HTTPResponse object instead of results object.
         :return: Real-Time Currency Conversion
         """
+        # Block when time-gating is enabled since this endpoint returns
+        # live conversion rates that could leak current market state.
+        if self.time_gate is not None:
+            return []
+
         url = f"/v1/conversion/{from_}/{to}"
 
         return self._get(

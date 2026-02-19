@@ -23,6 +23,10 @@ class SummariesClient(BaseClient):
         :param raw: Return raw object instead of results object
         :return: SummaryResults
         """
+        # Block when time-gating is enabled since this endpoint returns
+        # live summary data that could leak current market state.
+        if self.time_gate is not None:
+            return []
 
         url = f"/v1/summaries"
         return self._get(

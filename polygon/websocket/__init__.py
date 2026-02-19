@@ -14,6 +14,7 @@ import logging
 from ..exceptions import AuthError
 
 env_key = "POLYGON_API_KEY"
+TIME_GATE_ENV = "TIME_GATE"
 logger = get_logger("WebSocketClient")
 
 
@@ -47,6 +48,12 @@ class WebSocketClient:
             raise AuthError(
                 f"Must specify env var {env_key} or pass api_key in constructor"
             )
+
+        # Check if time-gating is enabled — WebSocket streams live data
+        # and cannot be time-gated, so block entirely.
+        time_gate_str = os.getenv(TIME_GATE_ENV, "").strip()
+        self._time_gate_enabled = bool(time_gate_str)
+
         self.api_key = api_key
         self.feed = feed
         self.market = market
@@ -89,6 +96,13 @@ class WebSocketClient:
         :param close_timeout: How long to wait for handshake when calling .close.
         :raises AuthError: If invalid API key is supplied.
         """
+        if self._time_gate_enabled:
+            logger.warning(
+                "WebSocket connections are disabled when TIME_GATE is set. "
+                "WebSocket streams live data that cannot be time-gated."
+            )
+            return
+
         reconnects = 0
         logger.debug("connect: %s", self.url)
         # darwin needs some extra <3

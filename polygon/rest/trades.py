@@ -64,6 +64,11 @@ class TradesClient(BaseClient):
         :param raw: Return raw object instead of results object
         :return: Last trade
         """
+        # Block when time-gating is enabled since this endpoint always
+        # returns the most recent trade (live).
+        if self.time_gate is not None:
+            return []
+
         url = f"/v2/last/trade/{ticker}"
 
         return self._get(
@@ -92,6 +97,11 @@ class TradesClient(BaseClient):
         :param raw: Return raw object instead of results object
         :return: Last crypto trade
         """
+        # Block when time-gating is enabled since this endpoint always
+        # returns the most recent crypto trade (live).
+        if self.time_gate is not None:
+            return []
+
         url = f"/v1/last/crypto/{from_}/{to}"
 
         return self._get(
