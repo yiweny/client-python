@@ -1,106 +1,116 @@
 from .base import BaseClient
 from typing import Optional, Any, Dict, List, Union, Iterator, Tuple
 from .models import Agg, GroupedDailyAgg, DailyOpenCloseAgg, PreviousCloseAgg, Sort
-from .models.splits import Split
 from urllib3 import HTTPResponse
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 
 from .models.request import RequestOptionBuilder
 
 
 class AggsClient(BaseClient):
     # ------------------------------------------------------------------
-    # Point-in-time split adjustment helpers
+    # Point-in-time adjustment via ratio rescaling
+    #
+    # Polygon's adjusted=true reflects ALL splits & dividends up to today.
+    # To get "point-in-time adjusted" prices (only events known at the
+    # gate date), we:
+    #   1. Fetch fully-adjusted prices from the API (adjusted=true).
+    #   2. Fetch ONE reference bar at the gate date, both adjusted and
+    #      unadjusted, to compute a gate_ratio.
+    #   3. Divide all adjusted prices by gate_ratio.
+    #
+    # gate_ratio captures every post-gate adjustment (splits + dividends).
+    # Dividing it out leaves only pre-gate adjustments — exactly what a
+    # person querying on the gate date would have seen.
     # ------------------------------------------------------------------
 
-    def _fetch_splits_before_gate(
+    def _compute_gate_adjustment_ratio(
         self, ticker: str
-    ) -> List[Tuple[int, float, float]]:
+    ) -> Tuple[float, float]:
         """
-        Fetch all stock splits for *ticker* with execution_date <= time_gate.
+        Return (price_ratio, volume_ratio) at the gate date.
 
-        Returns a sorted list of (execution_timestamp_ms, price_factor,
-        volume_factor) tuples.  price_factor = split_from / split_to
-        (e.g. 0.25 for a 4-for-1 split).
+        price_ratio  = adjusted_close / unadjusted_close
+        volume_ratio = adjusted_volume / unadjusted_volume
+
+        Dividing Polygon's fully-adjusted values by these ratios removes
+        every post-gate adjustment (splits + dividends).
+
+        Returns (1.0, 1.0) when no rescaling is needed.
         """
         if self.time_gate is None:
-            return []
+            return (1.0, 1.0)
 
         gate_date = self.time_gate.strftime("%Y-%m-%d")
+        # Look back up to 10 days to find a trading day at/before the gate
+        from_dt = self.time_gate - timedelta(days=10)
+        from_date = from_dt.strftime("%Y-%m-%d")
+        path = f"/v2/aggs/ticker/{ticker}/range/1/day/{from_date}/{gate_date}"
+
         try:
-            raw_splits = self._get(
-                path="/v3/reference/splits",
-                params={
-                    "ticker": ticker,
-                    "execution_date.lte": gate_date,
-                    "limit": 1000,
-                    "order": "asc",
-                    "sort": "execution_date",
-                },
+            adj_bars = self._get(
+                path=path,
+                params={"adjusted": "true", "limit": 10, "sort": "desc"},
                 result_key="results",
-                deserializer=Split.from_dict,
+                deserializer=Agg.from_dict,
+            )
+            raw_bars = self._get(
+                path=path,
+                params={"adjusted": "false", "limit": 10, "sort": "desc"},
+                result_key="results",
+                deserializer=Agg.from_dict,
             )
         except Exception:
-            return []
+            return (1.0, 1.0)
 
-        if not raw_splits or not isinstance(raw_splits, list):
-            return []
+        if (
+            not adj_bars
+            or not raw_bars
+            or not isinstance(adj_bars, list)
+            or not isinstance(raw_bars, list)
+        ):
+            return (1.0, 1.0)
 
-        events: List[Tuple[int, float, float]] = []
-        for s in raw_splits:
-            if (
-                s.execution_date
-                and s.split_from
-                and s.split_to
-                and s.split_to != 0
-            ):
-                try:
-                    exec_dt = datetime.strptime(s.execution_date, "%Y-%m-%d")
-                    exec_ts_ms = int(exec_dt.timestamp() * 1000)
-                    price_factor = s.split_from / s.split_to
-                    volume_factor = s.split_to / s.split_from
-                    events.append((exec_ts_ms, price_factor, volume_factor))
-                except (ValueError, ZeroDivisionError):
-                    continue
+        adj = adj_bars[0]  # most recent bar (desc sort)
+        raw = raw_bars[0]
 
-        events.sort(key=lambda x: x[0])
-        return events
+        price_ratio = 1.0
+        if (
+            adj.close is not None
+            and raw.close is not None
+            and raw.close != 0
+        ):
+            price_ratio = adj.close / raw.close
+
+        volume_ratio = 1.0
+        if (
+            adj.volume is not None
+            and raw.volume is not None
+            and raw.volume != 0
+        ):
+            volume_ratio = adj.volume / raw.volume
+
+        return (price_ratio, volume_ratio)
 
     @staticmethod
-    def _adjust_agg(
-        agg: Agg, split_events: List[Tuple[int, float, float]]
+    def _rescale_agg(
+        agg: Agg, price_ratio: float, volume_ratio: float
     ) -> Agg:
-        """
-        Apply point-in-time split adjustments to a single Agg bar.
-
-        For each split whose execution_date is *after* this bar's timestamp
-        (i.e. the split hadn't happened yet when this bar was recorded),
-        multiply prices by split_from/split_to and volume by split_to/split_from.
-        """
-        if not split_events or agg.timestamp is None:
-            return agg
-
-        cum_price = 1.0
-        cum_vol = 1.0
-        for exec_ts_ms, pf, vf in split_events:
-            if exec_ts_ms > agg.timestamp:
-                cum_price *= pf
-                cum_vol *= vf
-
-        if cum_price != 1.0:
+        """Divide an Agg's prices by *price_ratio* and volume by *volume_ratio*."""
+        if price_ratio != 1.0:
             if agg.open is not None:
-                agg.open = round(agg.open * cum_price, 4)
+                agg.open = round(agg.open / price_ratio, 4)
             if agg.high is not None:
-                agg.high = round(agg.high * cum_price, 4)
+                agg.high = round(agg.high / price_ratio, 4)
             if agg.low is not None:
-                agg.low = round(agg.low * cum_price, 4)
+                agg.low = round(agg.low / price_ratio, 4)
             if agg.close is not None:
-                agg.close = round(agg.close * cum_price, 4)
+                agg.close = round(agg.close / price_ratio, 4)
             if agg.vwap is not None:
-                agg.vwap = round(agg.vwap * cum_price, 4)
+                agg.vwap = round(agg.vwap / price_ratio, 4)
+        if volume_ratio != 1.0:
             if agg.volume is not None:
-                agg.volume = round(agg.volume * cum_vol, 4)
-
+                agg.volume = round(agg.volume / volume_ratio, 4)
         return agg
 
     # ------------------------------------------------------------------
@@ -187,13 +197,17 @@ class AggsClient(BaseClient):
         # Apply time gate to 'to' parameter
         to = self._apply_time_gate_to_agg_date(to)
 
-        # When time-gated: always fetch unadjusted from the API.
-        # If the caller wanted adjusted=True, we apply point-in-time
-        # split adjustments ourselves (only splits known at the gate).
+        # When time-gated and the caller wants adjusted data, we fetch
+        # adjusted=true from Polygon (which adjusts for ALL events up to
+        # today) and then rescale to remove post-gate adjustments.
+        # When the caller wants unadjusted, we just force adjusted=false.
         want_pit_adjust = False
         if self.time_gate is not None:
-            want_pit_adjust = adjusted is None or adjusted is True
-            adjusted = False
+            if adjusted is False:
+                pass  # caller explicitly wants raw — leave as-is
+            else:
+                want_pit_adjust = True
+                adjusted = True  # fetch fully-adjusted from API
 
         if isinstance(from_, datetime):
             from_ = int(from_.timestamp() * self.time_mult("millis"))
@@ -211,9 +225,9 @@ class AggsClient(BaseClient):
         )
 
         if want_pit_adjust and not raw:
-            split_events = self._fetch_splits_before_gate(ticker)
-            if split_events:
-                return (self._adjust_agg(a, split_events) for a in result)
+            pr, vr = self._compute_gate_adjustment_ratio(ticker)
+            if pr != 1.0 or vr != 1.0:
+                return (self._rescale_agg(a, pr, vr) for a in result)
 
         return result
 
@@ -250,13 +264,16 @@ class AggsClient(BaseClient):
         # Apply time gate to 'to' parameter
         to = self._apply_time_gate_to_agg_date(to)
 
-        # When time-gated: always fetch unadjusted from the API.
-        # If the caller wanted adjusted=True, we apply point-in-time
-        # split adjustments ourselves (only splits known at the gate).
+        # When time-gated and the caller wants adjusted data, we fetch
+        # adjusted=true from Polygon and then rescale to remove post-gate
+        # adjustments. When the caller wants unadjusted, force adjusted=false.
         want_pit_adjust = False
         if self.time_gate is not None:
-            want_pit_adjust = adjusted is None or adjusted is True
-            adjusted = False
+            if adjusted is False:
+                pass
+            else:
+                want_pit_adjust = True
+                adjusted = True
 
         if isinstance(from_, datetime):
             from_ = int(from_.timestamp() * self.time_mult("millis"))
@@ -275,10 +292,10 @@ class AggsClient(BaseClient):
         )
 
         if want_pit_adjust and not raw and isinstance(result, list):
-            split_events = self._fetch_splits_before_gate(ticker)
-            if split_events:
+            pr, vr = self._compute_gate_adjustment_ratio(ticker)
+            if pr != 1.0 or vr != 1.0:
                 for agg in result:
-                    self._adjust_agg(agg, split_events)
+                    self._rescale_agg(agg, pr, vr)
 
         return result
 
@@ -347,13 +364,15 @@ class AggsClient(BaseClient):
         # Apply time gate to date parameter
         date = self._apply_time_gate_to_agg_date(date)
 
-        # When time-gated: always fetch unadjusted from the API.
-        # If the caller wanted adjusted=True, we apply point-in-time
-        # split adjustments ourselves (only splits known at the gate).
+        # When time-gated and the caller wants adjusted data, we fetch
+        # adjusted=true and rescale. Otherwise force adjusted=false.
         want_pit_adjust = False
         if self.time_gate is not None:
-            want_pit_adjust = adjusted is None or adjusted is True
-            adjusted = False
+            if adjusted is False:
+                pass
+            else:
+                want_pit_adjust = True
+                adjusted = True
 
         url = f"/v1/open-close/{ticker}/{date}"
 
@@ -370,39 +389,13 @@ class AggsClient(BaseClient):
             and not raw
             and isinstance(result, DailyOpenCloseAgg)
         ):
-            split_events = self._fetch_splits_before_gate(ticker)
-            if split_events:
-                # DailyOpenCloseAgg doesn't have a millisecond timestamp;
-                # parse the from_ date string to get one for comparison.
-                bar_dt = None
-                if result.from_:
-                    try:
-                        bar_dt = datetime.strptime(result.from_, "%Y-%m-%d")
-                    except ValueError:
-                        pass
-                if bar_dt is not None:
-                    bar_ts = int(bar_dt.timestamp() * 1000)
-                    cum_price = 1.0
-                    for exec_ts_ms, pf, _ in split_events:
-                        if exec_ts_ms > bar_ts:
-                            cum_price *= pf
-                    if cum_price != 1.0:
-                        if result.open is not None:
-                            result.open = round(result.open * cum_price, 4)
-                        if result.high is not None:
-                            result.high = round(result.high * cum_price, 4)
-                        if result.low is not None:
-                            result.low = round(result.low * cum_price, 4)
-                        if result.close is not None:
-                            result.close = round(result.close * cum_price, 4)
-                        if result.after_hours is not None:
-                            result.after_hours = round(
-                                result.after_hours * cum_price, 4
-                            )
-                        if result.pre_market is not None:
-                            result.pre_market = round(
-                                result.pre_market * cum_price, 4
-                            )
+            pr, _ = self._compute_gate_adjustment_ratio(ticker)
+            if pr != 1.0:
+                for field in ("open", "high", "low", "close",
+                              "after_hours", "pre_market"):
+                    val = getattr(result, field, None)
+                    if val is not None:
+                        setattr(result, field, round(val / pr, 4))
 
         return result
 
