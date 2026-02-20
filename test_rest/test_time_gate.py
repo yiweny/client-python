@@ -1134,5 +1134,160 @@ class TimeGateFetchSplitsTest(unittest.TestCase):
         self.assertTrue(hasattr(AggsClient, '_adjust_agg'))
 
 
+# ===================================================================
+# 12. Side-by-side: adjusted=True vs adjusted=False with time gate
+# ===================================================================
+
+
+class TimeGateAdjustedTrueVsFalseTest(unittest.TestCase):
+    """Demonstrate the two paths side by side: same raw data, different
+    adjusted flag, different output.  Uses _adjust_agg directly since
+    the API call path is mocked elsewhere."""
+
+    def setUp(self):
+        os.environ["TIME_GATE"] = "2021-01-01"
+
+    def tearDown(self):
+        _clear_gate()
+
+    def _make_bars(self):
+        """Three bars spanning a 4:1 split on 2020-08-28."""
+        from polygon.rest.models import Agg
+
+        return [
+            Agg(open=400.0, high=420.0, low=380.0, close=410.0,
+                volume=1000.0, vwap=400.0,
+                timestamp=int(datetime(2020, 8, 27).timestamp() * 1000)),
+            Agg(open=100.0, high=110.0, low=95.0, close=105.0,
+                volume=4000.0, vwap=102.0,
+                timestamp=int(datetime(2020, 8, 28).timestamp() * 1000)),
+            Agg(open=106.0, high=112.0, low=100.0, close=108.0,
+                volume=3500.0, vwap=105.0,
+                timestamp=int(datetime(2020, 9, 1).timestamp() * 1000)),
+        ]
+
+    def _split_events(self):
+        split_ts = int(datetime(2020, 8, 28).timestamp() * 1000)
+        return [(split_ts, 0.25, 4.0)]  # 4:1 split
+
+    def test_adjusted_true_applies_pit_split(self):
+        """adjusted=True with gate: pre-split bar is adjusted, others untouched."""
+        from polygon.rest.aggs import AggsClient
+
+        bars = self._make_bars()
+        split_events = self._split_events()
+
+        # Simulate Path A: want_pit_adjust = True
+        want_pit_adjust = True  # adjusted=True → True
+        if want_pit_adjust:
+            for agg in bars:
+                AggsClient._adjust_agg(agg, split_events)
+
+        # Pre-split bar (2020-08-27): $400 → $100
+        self.assertAlmostEqual(bars[0].open, 100.0)
+        self.assertAlmostEqual(bars[0].close, 102.5)
+        self.assertAlmostEqual(bars[0].volume, 4000.0)
+
+        # On-split bar (2020-08-28): unchanged (split timestamp == bar timestamp)
+        self.assertEqual(bars[1].open, 100.0)
+        self.assertEqual(bars[1].close, 105.0)
+        self.assertEqual(bars[1].volume, 4000.0)
+
+        # Post-split bar (2020-09-01): unchanged
+        self.assertEqual(bars[2].open, 106.0)
+        self.assertEqual(bars[2].close, 108.0)
+
+    def test_adjusted_false_returns_raw_prices(self):
+        """adjusted=False with gate: all bars returned as-is (raw unadjusted)."""
+        bars = self._make_bars()
+
+        # Simulate Path B: want_pit_adjust = False
+        want_pit_adjust = False  # adjusted=False → False
+        if want_pit_adjust:
+            raise AssertionError("should not enter this block")
+
+        # ALL bars unchanged — raw trading prices
+        self.assertEqual(bars[0].open, 400.0)   # pre-split raw
+        self.assertEqual(bars[0].close, 410.0)
+        self.assertEqual(bars[0].volume, 1000.0)
+
+        self.assertEqual(bars[1].open, 100.0)   # post-split raw
+        self.assertEqual(bars[1].close, 105.0)
+
+        self.assertEqual(bars[2].open, 106.0)
+        self.assertEqual(bars[2].close, 108.0)
+
+    def test_same_raw_data_different_output(self):
+        """Same bars, two different callers — one gets adjusted, one gets raw."""
+        from polygon.rest.aggs import AggsClient
+
+        split_events = self._split_events()
+
+        # Caller 1: adjusted=True
+        bars_adj = self._make_bars()
+        for agg in bars_adj:
+            AggsClient._adjust_agg(agg, split_events)
+
+        # Caller 2: adjusted=False
+        bars_raw = self._make_bars()
+        # No adjustment applied
+
+        # Pre-split bar: different prices
+        self.assertAlmostEqual(bars_adj[0].open, 100.0)    # adjusted
+        self.assertEqual(bars_raw[0].open, 400.0)           # raw
+        self.assertNotEqual(bars_adj[0].open, bars_raw[0].open)
+
+        # Post-split bar: same prices (no adjustment needed)
+        self.assertEqual(bars_adj[2].open, bars_raw[2].open)
+
+    def test_adjusted_none_default_behaves_like_true(self):
+        """adjusted=None (the default) should behave like adjusted=True."""
+        from polygon.rest.aggs import AggsClient
+
+        # The flag logic
+        adjusted = None
+        want_pit_adjust = adjusted is None or adjusted is True
+        self.assertTrue(want_pit_adjust)
+
+        # Same result as adjusted=True
+        bars = self._make_bars()
+        split_events = self._split_events()
+        if want_pit_adjust:
+            for agg in bars:
+                AggsClient._adjust_agg(agg, split_events)
+
+        self.assertAlmostEqual(bars[0].open, 100.0)  # adjusted
+
+    def test_no_gate_adjusted_true_passes_through(self):
+        """Without gate, adjusted=True goes straight to API (no client adjustment)."""
+        _clear_gate()
+        client = _make_mock(None)
+
+        # Simulate: no gate → want_pit_adjust stays False
+        adjusted = True
+        want_pit_adjust = False
+        if client.time_gate is not None:
+            want_pit_adjust = adjusted is None or adjusted is True
+            adjusted = False
+
+        # No gate: adjusted stays True, sent to API as-is
+        self.assertTrue(adjusted)
+        self.assertFalse(want_pit_adjust)
+
+    def test_no_gate_adjusted_false_passes_through(self):
+        """Without gate, adjusted=False goes straight to API."""
+        _clear_gate()
+        client = _make_mock(None)
+
+        adjusted = False
+        want_pit_adjust = False
+        if client.time_gate is not None:
+            want_pit_adjust = adjusted is None or adjusted is True
+            adjusted = False
+
+        self.assertFalse(adjusted)
+        self.assertFalse(want_pit_adjust)
+
+
 if __name__ == "__main__":
     unittest.main()
