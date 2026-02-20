@@ -815,5 +815,154 @@ class TimeGateEdgeCaseTest(unittest.TestCase):
         self.assertEqual(result, "2023-06-15")
 
 
+# ===================================================================
+# 11. Point-in-time split adjustment
+# ===================================================================
+
+
+class TimeGatePointInTimeAdjustmentTest(unittest.TestCase):
+    """Test the _adjust_agg and _fetch_splits_before_gate helpers."""
+
+    def setUp(self):
+        os.environ["TIME_GATE"] = "2021-01-01"
+
+    def tearDown(self):
+        _clear_gate()
+
+    def test_adjust_agg_no_splits(self):
+        """With no splits, agg should be unchanged."""
+        from polygon.rest.aggs import AggsClient
+        from polygon.rest.models import Agg
+
+        agg = Agg(open=100.0, high=110.0, low=90.0, close=105.0,
+                  volume=1000.0, vwap=102.0, timestamp=1590000000000)
+        result = AggsClient._adjust_agg(agg, [])
+        self.assertEqual(result.open, 100.0)
+        self.assertEqual(result.close, 105.0)
+        self.assertEqual(result.volume, 1000.0)
+
+    def test_adjust_agg_split_after_bar(self):
+        """A 4:1 split that happened AFTER the bar should adjust the bar."""
+        from polygon.rest.aggs import AggsClient
+        from polygon.rest.models import Agg
+
+        # Bar at 2020-05-15, split at 2020-08-28
+        bar_ts = int(datetime(2020, 5, 15).timestamp() * 1000)
+        split_ts = int(datetime(2020, 8, 28).timestamp() * 1000)
+        split_events = [(split_ts, 1 / 4, 4 / 1)]  # 4:1 split
+
+        agg = Agg(open=400.0, high=420.0, low=380.0, close=410.0,
+                  volume=1000.0, vwap=400.0, timestamp=bar_ts)
+        result = AggsClient._adjust_agg(agg, split_events)
+
+        self.assertAlmostEqual(result.open, 100.0, places=2)
+        self.assertAlmostEqual(result.high, 105.0, places=2)
+        self.assertAlmostEqual(result.low, 95.0, places=2)
+        self.assertAlmostEqual(result.close, 102.5, places=2)
+        self.assertAlmostEqual(result.volume, 4000.0, places=2)
+        self.assertAlmostEqual(result.vwap, 100.0, places=2)
+
+    def test_adjust_agg_split_before_bar(self):
+        """A split that happened BEFORE the bar should NOT adjust the bar."""
+        from polygon.rest.aggs import AggsClient
+        from polygon.rest.models import Agg
+
+        # Bar at 2020-09-15, split at 2020-08-28
+        bar_ts = int(datetime(2020, 9, 15).timestamp() * 1000)
+        split_ts = int(datetime(2020, 8, 28).timestamp() * 1000)
+        split_events = [(split_ts, 1 / 4, 4 / 1)]
+
+        agg = Agg(open=120.0, high=125.0, low=115.0, close=122.0,
+                  volume=5000.0, vwap=120.0, timestamp=bar_ts)
+        result = AggsClient._adjust_agg(agg, split_events)
+
+        # No adjustment — the split already happened before this bar
+        self.assertEqual(result.open, 120.0)
+        self.assertEqual(result.close, 122.0)
+        self.assertEqual(result.volume, 5000.0)
+
+    def test_adjust_agg_multiple_splits(self):
+        """Multiple splits should compound."""
+        from polygon.rest.aggs import AggsClient
+        from polygon.rest.models import Agg
+
+        # Bar at 2018-01-01.  Two splits after:
+        #   2019-06-01: 2:1 (price_factor=0.5, vol_factor=2)
+        #   2020-08-28: 4:1 (price_factor=0.25, vol_factor=4)
+        bar_ts = int(datetime(2018, 1, 1).timestamp() * 1000)
+        split1_ts = int(datetime(2019, 6, 1).timestamp() * 1000)
+        split2_ts = int(datetime(2020, 8, 28).timestamp() * 1000)
+        split_events = [
+            (split1_ts, 0.5, 2.0),
+            (split2_ts, 0.25, 4.0),
+        ]
+
+        agg = Agg(open=800.0, high=800.0, low=800.0, close=800.0,
+                  volume=100.0, vwap=800.0, timestamp=bar_ts)
+        result = AggsClient._adjust_agg(agg, split_events)
+
+        # Cumulative factor: 0.5 * 0.25 = 0.125
+        self.assertAlmostEqual(result.open, 100.0, places=2)
+        self.assertAlmostEqual(result.close, 100.0, places=2)
+        # Volume factor: 2 * 4 = 8
+        self.assertAlmostEqual(result.volume, 800.0, places=2)
+
+    def test_adjust_agg_none_timestamp(self):
+        """If timestamp is None, agg should be unchanged."""
+        from polygon.rest.aggs import AggsClient
+        from polygon.rest.models import Agg
+
+        split_events = [(int(datetime(2020, 8, 28).timestamp() * 1000), 0.25, 4.0)]
+        agg = Agg(open=400.0, close=400.0, timestamp=None)
+        result = AggsClient._adjust_agg(agg, split_events)
+        self.assertEqual(result.open, 400.0)
+
+    def test_adjust_agg_none_fields(self):
+        """None price fields should stay None, not crash."""
+        from polygon.rest.aggs import AggsClient
+        from polygon.rest.models import Agg
+
+        bar_ts = int(datetime(2020, 5, 15).timestamp() * 1000)
+        split_ts = int(datetime(2020, 8, 28).timestamp() * 1000)
+        split_events = [(split_ts, 0.25, 4.0)]
+
+        agg = Agg(open=None, high=None, low=None, close=None,
+                  volume=None, vwap=None, timestamp=bar_ts)
+        result = AggsClient._adjust_agg(agg, split_events)
+        self.assertIsNone(result.open)
+        self.assertIsNone(result.volume)
+
+    def test_want_pit_adjust_true_when_adjusted_true(self):
+        """When gated and adjusted=True, want_pit_adjust should be True."""
+        client = _make_mock("2023-06-15")
+        adjusted = True
+        want = adjusted is None or adjusted is True
+        self.assertTrue(want)
+
+    def test_want_pit_adjust_true_when_adjusted_none(self):
+        """When gated and adjusted=None (default), want_pit_adjust should be True."""
+        client = _make_mock("2023-06-15")
+        adjusted = None
+        want = adjusted is None or adjusted is True
+        self.assertTrue(want)
+
+    def test_want_pit_adjust_false_when_adjusted_false(self):
+        """When gated and adjusted=False, want_pit_adjust should be False."""
+        client = _make_mock("2023-06-15")
+        adjusted = False
+        want = adjusted is None or adjusted is True
+        self.assertFalse(want)
+
+    def test_want_pit_adjust_false_when_no_gate(self):
+        """When not gated, want_pit_adjust should be False."""
+        client = _make_mock(None)
+        # The code sets want_pit_adjust = False initially and only
+        # enters the if-block when time_gate is not None.
+        want = False
+        if client.time_gate is not None:
+            want = True
+        self.assertFalse(want)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1,6 +1,7 @@
 from .base import BaseClient
-from typing import Optional, Any, Dict, List, Union, Iterator
+from typing import Optional, Any, Dict, List, Union, Iterator, Tuple
 from .models import Agg, GroupedDailyAgg, DailyOpenCloseAgg, PreviousCloseAgg, Sort
+from .models.splits import Split
 from urllib3 import HTTPResponse
 from datetime import datetime, date
 
@@ -8,6 +9,102 @@ from .models.request import RequestOptionBuilder
 
 
 class AggsClient(BaseClient):
+    # ------------------------------------------------------------------
+    # Point-in-time split adjustment helpers
+    # ------------------------------------------------------------------
+
+    def _fetch_splits_before_gate(
+        self, ticker: str
+    ) -> List[Tuple[int, float, float]]:
+        """
+        Fetch all stock splits for *ticker* with execution_date <= time_gate.
+
+        Returns a sorted list of (execution_timestamp_ms, price_factor,
+        volume_factor) tuples.  price_factor = split_from / split_to
+        (e.g. 0.25 for a 4-for-1 split).
+        """
+        if self.time_gate is None:
+            return []
+
+        gate_date = self.time_gate.strftime("%Y-%m-%d")
+        try:
+            raw_splits = self._get(
+                path="/v3/reference/splits",
+                params={
+                    "ticker": ticker,
+                    "execution_date.lte": gate_date,
+                    "limit": 1000,
+                    "order": "asc",
+                    "sort": "execution_date",
+                },
+                result_key="results",
+                deserializer=Split.from_dict,
+            )
+        except Exception:
+            return []
+
+        if not raw_splits or not isinstance(raw_splits, list):
+            return []
+
+        events: List[Tuple[int, float, float]] = []
+        for s in raw_splits:
+            if (
+                s.execution_date
+                and s.split_from
+                and s.split_to
+                and s.split_to != 0
+            ):
+                try:
+                    exec_dt = datetime.strptime(s.execution_date, "%Y-%m-%d")
+                    exec_ts_ms = int(exec_dt.timestamp() * 1000)
+                    price_factor = s.split_from / s.split_to
+                    volume_factor = s.split_to / s.split_from
+                    events.append((exec_ts_ms, price_factor, volume_factor))
+                except (ValueError, ZeroDivisionError):
+                    continue
+
+        events.sort(key=lambda x: x[0])
+        return events
+
+    @staticmethod
+    def _adjust_agg(
+        agg: Agg, split_events: List[Tuple[int, float, float]]
+    ) -> Agg:
+        """
+        Apply point-in-time split adjustments to a single Agg bar.
+
+        For each split whose execution_date is *after* this bar's timestamp
+        (i.e. the split hadn't happened yet when this bar was recorded),
+        multiply prices by split_from/split_to and volume by split_to/split_from.
+        """
+        if not split_events or agg.timestamp is None:
+            return agg
+
+        cum_price = 1.0
+        cum_vol = 1.0
+        for exec_ts_ms, pf, vf in split_events:
+            if exec_ts_ms > agg.timestamp:
+                cum_price *= pf
+                cum_vol *= vf
+
+        if cum_price != 1.0:
+            if agg.open is not None:
+                agg.open = round(agg.open * cum_price, 4)
+            if agg.high is not None:
+                agg.high = round(agg.high * cum_price, 4)
+            if agg.low is not None:
+                agg.low = round(agg.low * cum_price, 4)
+            if agg.close is not None:
+                agg.close = round(agg.close * cum_price, 4)
+            if agg.vwap is not None:
+                agg.vwap = round(agg.vwap * cum_price, 4)
+            if agg.volume is not None:
+                agg.volume = round(agg.volume * cum_vol, 4)
+
+        return agg
+
+    # ------------------------------------------------------------------
+
     def _apply_time_gate_to_agg_date(
         self, value: Union[str, int, datetime, date]
     ) -> Union[str, int, datetime, date]:
@@ -90,10 +187,12 @@ class AggsClient(BaseClient):
         # Apply time gate to 'to' parameter
         to = self._apply_time_gate_to_agg_date(to)
 
-        # Force unadjusted data when time-gated so prices reflect what
-        # was actually observable at that point in time (no retroactive
-        # split/dividend adjustments).
+        # When time-gated: always fetch unadjusted from the API.
+        # If the caller wanted adjusted=True, we apply point-in-time
+        # split adjustments ourselves (only splits known at the gate).
+        want_pit_adjust = False
         if self.time_gate is not None:
+            want_pit_adjust = adjusted is None or adjusted is True
             adjusted = False
 
         if isinstance(from_, datetime):
@@ -103,13 +202,20 @@ class AggsClient(BaseClient):
             to = int(to.timestamp() * self.time_mult("millis"))
         url = f"/v2/aggs/ticker/{ticker}/range/{multiplier}/{timespan}/{from_}/{to}"
 
-        return self._paginate(
+        result = self._paginate(
             path=url,
             params=self._get_params(self.list_aggs, locals()),
             raw=raw,
             deserializer=Agg.from_dict,
             options=options,
         )
+
+        if want_pit_adjust and not raw:
+            split_events = self._fetch_splits_before_gate(ticker)
+            if split_events:
+                return (self._adjust_agg(a, split_events) for a in result)
+
+        return result
 
     def get_aggs(
         self,
@@ -144,10 +250,12 @@ class AggsClient(BaseClient):
         # Apply time gate to 'to' parameter
         to = self._apply_time_gate_to_agg_date(to)
 
-        # Force unadjusted data when time-gated so prices reflect what
-        # was actually observable at that point in time (no retroactive
-        # split/dividend adjustments).
+        # When time-gated: always fetch unadjusted from the API.
+        # If the caller wanted adjusted=True, we apply point-in-time
+        # split adjustments ourselves (only splits known at the gate).
+        want_pit_adjust = False
         if self.time_gate is not None:
+            want_pit_adjust = adjusted is None or adjusted is True
             adjusted = False
 
         if isinstance(from_, datetime):
@@ -157,7 +265,7 @@ class AggsClient(BaseClient):
             to = int(to.timestamp() * self.time_mult("millis"))
         url = f"/v2/aggs/ticker/{ticker}/range/{multiplier}/{timespan}/{from_}/{to}"
 
-        return self._get(
+        result = self._get(
             path=url,
             params=self._get_params(self.get_aggs, locals()),
             result_key="results",
@@ -165,6 +273,14 @@ class AggsClient(BaseClient):
             raw=raw,
             options=options,
         )
+
+        if want_pit_adjust and not raw and isinstance(result, list):
+            split_events = self._fetch_splits_before_gate(ticker)
+            if split_events:
+                for agg in result:
+                    self._adjust_agg(agg, split_events)
+
+        return result
 
     # TODO: next breaking change release move "market_type" to be 2nd mandatory
     # param
@@ -191,8 +307,10 @@ class AggsClient(BaseClient):
         # Apply time gate to date parameter
         date = self._apply_time_gate_to_agg_date(date)
 
-        # Force unadjusted data when time-gated so prices reflect what
-        # was actually observable at that point in time.
+        # Force unadjusted data when time-gated.  Point-in-time split
+        # adjustment is NOT applied here because grouped daily returns
+        # data for the entire market (thousands of tickers) and fetching
+        # splits for each would be impractical.
         if self.time_gate is not None:
             adjusted = False
 
@@ -229,20 +347,64 @@ class AggsClient(BaseClient):
         # Apply time gate to date parameter
         date = self._apply_time_gate_to_agg_date(date)
 
-        # Force unadjusted data when time-gated so prices reflect what
-        # was actually observable at that point in time.
+        # When time-gated: always fetch unadjusted from the API.
+        # If the caller wanted adjusted=True, we apply point-in-time
+        # split adjustments ourselves (only splits known at the gate).
+        want_pit_adjust = False
         if self.time_gate is not None:
+            want_pit_adjust = adjusted is None or adjusted is True
             adjusted = False
 
         url = f"/v1/open-close/{ticker}/{date}"
 
-        return self._get(
+        result = self._get(
             path=url,
             params=self._get_params(self.get_daily_open_close_agg, locals()),
             deserializer=DailyOpenCloseAgg.from_dict,
             raw=raw,
             options=options,
         )
+
+        if (
+            want_pit_adjust
+            and not raw
+            and isinstance(result, DailyOpenCloseAgg)
+        ):
+            split_events = self._fetch_splits_before_gate(ticker)
+            if split_events:
+                # DailyOpenCloseAgg doesn't have a millisecond timestamp;
+                # parse the from_ date string to get one for comparison.
+                bar_dt = None
+                if result.from_:
+                    try:
+                        bar_dt = datetime.strptime(result.from_, "%Y-%m-%d")
+                    except ValueError:
+                        pass
+                if bar_dt is not None:
+                    bar_ts = int(bar_dt.timestamp() * 1000)
+                    cum_price = 1.0
+                    for exec_ts_ms, pf, _ in split_events:
+                        if exec_ts_ms > bar_ts:
+                            cum_price *= pf
+                    if cum_price != 1.0:
+                        if result.open is not None:
+                            result.open = round(result.open * cum_price, 4)
+                        if result.high is not None:
+                            result.high = round(result.high * cum_price, 4)
+                        if result.low is not None:
+                            result.low = round(result.low * cum_price, 4)
+                        if result.close is not None:
+                            result.close = round(result.close * cum_price, 4)
+                        if result.after_hours is not None:
+                            result.after_hours = round(
+                                result.after_hours * cum_price, 4
+                            )
+                        if result.pre_market is not None:
+                            result.pre_market = round(
+                                result.pre_market * cum_price, 4
+                            )
+
+        return result
 
     def get_previous_close_agg(
         self,
