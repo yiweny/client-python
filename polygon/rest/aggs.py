@@ -47,21 +47,30 @@ class AggsClient(BaseClient):
         from_date = from_dt.strftime("%Y-%m-%d")
         path = f"/v2/aggs/ticker/{ticker}/range/1/day/{from_date}/{gate_date}"
 
-        try:
-            adj_bars = self._get(
-                path=path,
-                params={"adjusted": "true", "limit": 10, "sort": "desc"},
-                result_key="results",
-                deserializer=Agg.from_dict,
-            )
-            raw_bars = self._get(
-                path=path,
-                params={"adjusted": "false", "limit": 10, "sort": "desc"},
-                result_key="results",
-                deserializer=Agg.from_dict,
-            )
-        except Exception:
-            return (1.0, 1.0)
+        import time
+
+        adj_bars = None
+        raw_bars = None
+        for attempt in range(3):
+            try:
+                adj_bars = self._get(
+                    path=path,
+                    params={"adjusted": "true", "limit": 10, "sort": "desc"},
+                    result_key="results",
+                    deserializer=Agg.from_dict,
+                )
+                raw_bars = self._get(
+                    path=path,
+                    params={"adjusted": "false", "limit": 10, "sort": "desc"},
+                    result_key="results",
+                    deserializer=Agg.from_dict,
+                )
+                break
+            except Exception:
+                if attempt < 2:
+                    time.sleep(0.5 * (attempt + 1))
+                else:
+                    return (1.0, 1.0)
 
         if (
             not adj_bars
