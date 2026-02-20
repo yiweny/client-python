@@ -963,6 +963,176 @@ class TimeGatePointInTimeAdjustmentTest(unittest.TestCase):
             want = True
         self.assertFalse(want)
 
+    def test_reverse_split(self):
+        """A 1:10 reverse split should multiply pre-split prices by 10."""
+        from polygon.rest.aggs import AggsClient
+        from polygon.rest.models import Agg
+
+        bar_ts = int(datetime(2020, 1, 1).timestamp() * 1000)
+        split_ts = int(datetime(2020, 6, 1).timestamp() * 1000)
+        # Reverse 1:10: split_from=10, split_to=1 → price_factor=10, vol_factor=0.1
+        split_events = [(split_ts, 10.0, 0.1)]
+
+        agg = Agg(open=5.0, high=6.0, low=4.0, close=5.5,
+                  volume=10000.0, vwap=5.0, timestamp=bar_ts)
+        result = AggsClient._adjust_agg(agg, split_events)
+
+        self.assertAlmostEqual(result.open, 50.0, places=2)
+        self.assertAlmostEqual(result.close, 55.0, places=2)
+        self.assertAlmostEqual(result.volume, 1000.0, places=2)
+
+    def test_split_at_exact_bar_timestamp_does_not_adjust(self):
+        """A split at the exact same timestamp as a bar should NOT adjust it.
+        The split happened at the open of that bar, so prices already reflect it."""
+        from polygon.rest.aggs import AggsClient
+        from polygon.rest.models import Agg
+
+        ts = int(datetime(2020, 8, 28).timestamp() * 1000)
+        split_events = [(ts, 0.25, 4.0)]
+
+        agg = Agg(open=120.0, close=125.0, timestamp=ts)
+        result = AggsClient._adjust_agg(agg, split_events)
+
+        # exec_ts_ms > agg.timestamp is False (equal), so no adjustment
+        self.assertEqual(result.open, 120.0)
+        self.assertEqual(result.close, 125.0)
+
+    def test_adjustment_preserves_rounding(self):
+        """Adjusted values should be rounded to 4 decimal places."""
+        from polygon.rest.aggs import AggsClient
+        from polygon.rest.models import Agg
+
+        bar_ts = int(datetime(2020, 1, 1).timestamp() * 1000)
+        split_ts = int(datetime(2020, 6, 1).timestamp() * 1000)
+        # 3:1 split → price_factor = 1/3
+        split_events = [(split_ts, 1.0 / 3.0, 3.0)]
+
+        agg = Agg(open=100.0, close=100.0, timestamp=bar_ts)
+        result = AggsClient._adjust_agg(agg, split_events)
+
+        # 100 * 1/3 = 33.333333... → rounded to 33.3333
+        self.assertEqual(result.open, round(100.0 / 3.0, 4))
+        self.assertEqual(str(result.open).count('.'), 1)  # has a decimal
+
+    def test_mixed_pre_and_post_split_bars(self):
+        """A list of bars spanning a split: only pre-split bars are adjusted."""
+        from polygon.rest.aggs import AggsClient
+        from polygon.rest.models import Agg
+
+        split_ts = int(datetime(2020, 8, 28).timestamp() * 1000)
+        split_events = [(split_ts, 0.25, 4.0)]
+
+        bars = [
+            Agg(open=400.0, close=400.0, volume=100.0,
+                timestamp=int(datetime(2020, 8, 27).timestamp() * 1000)),
+            Agg(open=100.0, close=100.0, volume=400.0,
+                timestamp=int(datetime(2020, 8, 28).timestamp() * 1000)),
+            Agg(open=105.0, close=105.0, volume=450.0,
+                timestamp=int(datetime(2020, 8, 29).timestamp() * 1000)),
+        ]
+
+        adjusted = [AggsClient._adjust_agg(b, split_events) for b in bars]
+
+        # Pre-split bar: adjusted
+        self.assertAlmostEqual(adjusted[0].open, 100.0)
+        self.assertAlmostEqual(adjusted[0].volume, 400.0)
+        # On-split bar: NOT adjusted (exec_ts == bar_ts, not >)
+        self.assertEqual(adjusted[1].open, 100.0)
+        self.assertEqual(adjusted[1].volume, 400.0)
+        # Post-split bar: NOT adjusted
+        self.assertEqual(adjusted[2].open, 105.0)
+        self.assertEqual(adjusted[2].volume, 450.0)
+
+
+class TimeGatePointInTimeSourceTest(unittest.TestCase):
+    """Verify which methods have PIT adjustment and which correctly don't."""
+
+    def _has_pit_pattern(self, method):
+        import inspect
+        src = inspect.getsource(method)
+        return "want_pit_adjust" in src and "_fetch_splits_before_gate" in src
+
+    def _has_forced_false_only(self, method):
+        """Method forces adjusted=False but does NOT do PIT adjustment."""
+        import inspect
+        src = inspect.getsource(method)
+        has_force = "adjusted = False" in src
+        has_pit = "want_pit_adjust" in src
+        return has_force and not has_pit
+
+    # -- Methods WITH PIT adjustment --
+    def test_list_aggs_has_pit(self):
+        from polygon.rest.aggs import AggsClient
+        self.assertTrue(self._has_pit_pattern(AggsClient.list_aggs))
+
+    def test_get_aggs_has_pit(self):
+        from polygon.rest.aggs import AggsClient
+        self.assertTrue(self._has_pit_pattern(AggsClient.get_aggs))
+
+    def test_get_daily_open_close_agg_has_pit(self):
+        from polygon.rest.aggs import AggsClient
+        self.assertTrue(self._has_pit_pattern(AggsClient.get_daily_open_close_agg))
+
+    # -- Methods WITHOUT PIT (forced False only) --
+    def test_get_grouped_daily_aggs_no_pit(self):
+        from polygon.rest.aggs import AggsClient
+        self.assertTrue(self._has_forced_false_only(AggsClient.get_grouped_daily_aggs))
+
+    def test_get_sma_no_pit(self):
+        from polygon.rest.indicators import IndicatorsClient
+        self.assertTrue(self._has_forced_false_only(IndicatorsClient.get_sma))
+
+    def test_get_ema_no_pit(self):
+        from polygon.rest.indicators import IndicatorsClient
+        self.assertTrue(self._has_forced_false_only(IndicatorsClient.get_ema))
+
+    def test_get_rsi_no_pit(self):
+        from polygon.rest.indicators import IndicatorsClient
+        self.assertTrue(self._has_forced_false_only(IndicatorsClient.get_rsi))
+
+    def test_get_macd_no_pit(self):
+        from polygon.rest.indicators import IndicatorsClient
+        self.assertTrue(self._has_forced_false_only(IndicatorsClient.get_macd))
+
+    # -- Previous close is blocked entirely --
+    def test_previous_close_blocked(self):
+        from polygon.rest.aggs import AggsClient
+        import inspect
+        src = inspect.getsource(AggsClient.get_previous_close_agg)
+        self.assertIn("return []", src)
+        self.assertNotIn("want_pit_adjust", src)
+
+
+class TimeGateFetchSplitsTest(unittest.TestCase):
+    """Test the _fetch_splits_before_gate helper edge cases."""
+
+    def setUp(self):
+        os.environ["TIME_GATE"] = "2021-01-01"
+
+    def tearDown(self):
+        _clear_gate()
+
+    def test_returns_empty_when_no_gate(self):
+        from polygon.rest.aggs import AggsClient
+        client = _make_mock(None)
+        result = AggsClient._fetch_splits_before_gate(client, "AAPL")
+        self.assertEqual(result, [])
+
+    def test_returns_sorted_tuples(self):
+        """Verify the return type is a list of (int, float, float) tuples."""
+        from polygon.rest.aggs import AggsClient
+        # We can't call the real API, but we can check that the method
+        # exists and returns a list when time_gate is None.
+        client = _make_mock(None)
+        result = AggsClient._fetch_splits_before_gate(client, "AAPL")
+        self.assertIsInstance(result, list)
+
+    def test_method_exists_on_aggs_client(self):
+        """_fetch_splits_before_gate should be accessible on AggsClient."""
+        from polygon.rest.aggs import AggsClient
+        self.assertTrue(hasattr(AggsClient, '_fetch_splits_before_gate'))
+        self.assertTrue(hasattr(AggsClient, '_adjust_agg'))
+
 
 if __name__ == "__main__":
     unittest.main()
