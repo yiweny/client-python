@@ -876,6 +876,111 @@ class TimeGateRescaleAggTest(unittest.TestCase):
         self.assertAlmostEqual(agg.close, 104.0)
         self.assertAlmostEqual(agg.volume, 2000.0)
 
+    # -- Explicit split scenario --
+    def test_split_scenario_concrete(self):
+        """Concrete AAPL-like 4:1 split scenario.
+
+        Setup: AAPL 4:1 split on 2020-08-28.  Gate = 2020-12-01.
+        At the gate date: adj_close=$30, raw_close=$120 → gate_ratio=0.25
+        (because Polygon divided everything by 4 for the split).
+
+        Bar on 2020-05-15 (before split):
+          Polygon adjusted close: $79 (was $316 raw, ÷4 by Polygon)
+          PIT adjusted: $79 / 0.25 = $316 ... wait, that's the raw price.
+
+        Actually for a split BEFORE the gate, the gate_ratio already
+        reflects it, so dividing by gate_ratio is a no-op for the split
+        portion.  The ratio approach correctly keeps pre-gate adjustments.
+
+        Let's model a split AFTER the gate instead:
+        Split on 2022-01-01 (after gate 2021-01-01).
+        At gate: adj=$50 (÷4 by Polygon for post-gate split), raw=$200
+        gate_ratio = 50/200 = 0.25.
+
+        Bar on 2020-05-15:
+          Polygon adj close: $50 (was $200 raw, ÷4 by Polygon)
+          PIT adjusted: $50 / 0.25 = $200 ← post-gate split removed! ✓
+        """
+        from polygon.rest.aggs import AggsClient
+        from polygon.rest.models import Agg
+
+        # Polygon returned $50 (fully adjusted for post-gate 4:1 split)
+        agg = Agg(open=50.0, close=50.0, volume=8000.0, timestamp=1590000000000)
+        # gate_ratio = 0.25 (post-gate split captured at gate date)
+        AggsClient._rescale_agg(agg, price_ratio=0.25, volume_ratio=4.0)
+
+        # Post-gate split removed: $50 / 0.25 = $200 (original price)
+        self.assertAlmostEqual(agg.close, 200.0)
+        self.assertAlmostEqual(agg.volume, 2000.0)
+
+    # -- Explicit dividend scenario --
+    def test_dividend_scenario_concrete(self):
+        """Concrete dividend scenario.
+
+        Setup: $2.00 dividend ex-date 2021-06-01 (AFTER gate 2021-01-01).
+        At gate date: stock trades at $100.
+          Polygon adj_close = $100 - $2 = $98 (proportional: $100 * 0.98)
+          raw_close = $100
+          gate_ratio = 98/100 = 0.98
+
+        Bar on 2020-06-15 (before dividend):
+          raw close: $80
+          Polygon adj close: $80 * 0.98 = $78.40
+          PIT adjusted: $78.40 / 0.98 = $80.00 ← dividend removed! ✓
+        """
+        from polygon.rest.aggs import AggsClient
+        from polygon.rest.models import Agg
+
+        # Polygon returned $78.40 (adjusted for post-gate $2 dividend on $100 stock)
+        agg = Agg(open=78.40, close=78.40, volume=1000.0, timestamp=1590000000000)
+        # gate_ratio = 0.98 (dividend captured)
+        AggsClient._rescale_agg(agg, price_ratio=0.98, volume_ratio=1.0)
+
+        # Post-gate dividend removed: $78.40 / 0.98 = $80.00
+        self.assertAlmostEqual(agg.close, 80.0, places=2)
+        # Volume unchanged (dividends don't affect volume)
+        self.assertEqual(agg.volume, 1000.0)
+
+    # -- Split + Dividend combined --
+    def test_split_and_dividend_combined(self):
+        """Both a split AND dividend after the gate — ratio captures both.
+
+        Post-gate: 4:1 split + $1 dividend on $100 stock.
+        gate_ratio for price = 0.25 * 0.99 = 0.2475
+        (split factor × dividend factor)
+        """
+        from polygon.rest.aggs import AggsClient
+        from polygon.rest.models import Agg
+
+        # Polygon adj close: $400 * 0.2475 = $99.00
+        agg = Agg(close=99.0, timestamp=1590000000000)
+        AggsClient._rescale_agg(agg, price_ratio=0.2475, volume_ratio=4.0)
+
+        # Removing both: $99 / 0.2475 = $400
+        self.assertAlmostEqual(agg.close, 400.0, places=0)
+
+    # -- Pre-gate split kept, post-gate dividend removed --
+    def test_pre_gate_split_kept_post_gate_dividend_removed(self):
+        """A split BEFORE the gate is kept; a dividend AFTER is removed.
+
+        Pre-gate 2:1 split + post-gate $1 dividend on $50 stock.
+        gate_ratio = 0.98 (only the dividend, since the split is pre-gate
+        and already baked into both adj and unadj at the gate date).
+
+        Bar on 2019-01-01 (before the pre-gate split):
+          raw close: $100 (pre-split)
+          Polygon adj: $100 * 0.5 (split) * 0.98 (dividend) = $49.00
+          PIT adjusted: $49.00 / 0.98 = $50.00
+          This is the split-adjusted price WITHOUT the dividend. ✓
+        """
+        from polygon.rest.aggs import AggsClient
+        from polygon.rest.models import Agg
+
+        agg = Agg(close=49.0, timestamp=1590000000000)
+        AggsClient._rescale_agg(agg, price_ratio=0.98, volume_ratio=1.0)
+
+        self.assertAlmostEqual(agg.close, 50.0, places=1)
+
 
 class TimeGateComputeRatioTest(unittest.TestCase):
     """Test _compute_gate_adjustment_ratio edge cases."""
