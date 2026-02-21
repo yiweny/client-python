@@ -243,7 +243,8 @@ class TimeGateParamsApplicationTest(unittest.TestCase):
         p = {"date.gte": "2023-01-01"}
         result = self.client._apply_time_gate_to_params(p)
         self.assertIn("date.lte", result)
-        self.assertEqual(result["date.lte"], "2023-06-15")
+        # Injected date caps use (gate_date - 1 day) to avoid intraday leakage
+        self.assertEqual(result["date.lte"], "2023-06-14")
 
     # -- always inject all date caps even without caller filters --
     def test_always_injects_execution_date_lte(self):
@@ -251,7 +252,8 @@ class TimeGateParamsApplicationTest(unittest.TestCase):
         p = {"ticker": "AAPL"}
         result = self.client._apply_time_gate_to_params(p)
         self.assertIn("execution_date.lte", result)
-        self.assertEqual(result["execution_date.lte"], "2023-06-15")
+        # Uses (gate_date - 1 day) for safety
+        self.assertEqual(result["execution_date.lte"], "2023-06-14")
 
     def test_always_injects_ex_dividend_date_lte(self):
         p = {"ticker": "AAPL"}
@@ -263,10 +265,13 @@ class TimeGateParamsApplicationTest(unittest.TestCase):
         result = self.client._apply_time_gate_to_params(p)
         self.assertIn("listing_date.lte", result)
 
-    def test_always_injects_published_utc_lte(self):
+    def test_always_injects_published_utc_lte_as_datetime(self):
+        """published_utc accepts full UTC datetime — no day rounding."""
         p = {"ticker": "AAPL"}
         result = self.client._apply_time_gate_to_params(p)
         self.assertIn("published_utc.lte", result)
+        # Should be exact UTC datetime, not a date
+        self.assertEqual(result["published_utc.lte"], "2023-06-15T00:00:00Z")
 
     def test_always_injects_filing_date_lte(self):
         p = {}

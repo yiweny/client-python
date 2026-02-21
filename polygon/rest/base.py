@@ -6,7 +6,7 @@ import os
 from urllib3.util.retry import Retry
 from enum import Enum
 from typing import Optional, Any, Dict, Union
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from importlib.metadata import version, PackageNotFoundError
 from .models.request import RequestOptionBuilder
 from ..logging import get_logger
@@ -335,18 +335,34 @@ class BaseClient:
         # exists. This ensures the time gate is enforced even when the caller
         # omits date filters entirely (e.g. list_splits(ticker="AAPL")
         # without an execution_date filter).
+        #
+        # Three precision levels depending on what the Polygon API accepts:
+        #   - timestamp:     nanosecond UTC int  (exact, no rounding)
+        #   - published_utc: ISO-8601 datetime   (exact, no rounding)
+        #   - all others:    YYYY-MM-DD date-only (API rejects datetimes,
+        #                    so we round DOWN to the previous day to avoid
+        #                    leaking events later in the gate date)
+        safe_date = (self.time_gate.date() - timedelta(days=1)).strftime(
+            "%Y-%m-%d"
+        )
+        safe_utc_datetime = self.time_gate.strftime("%Y-%m-%dT%H:%M:%SZ")
+
         for base_param in timestamp_base_params:
             lte_param = f"{base_param}.lte"
             lt_param = f"{base_param}.lt"
 
             if lte_param not in params and lt_param not in params:
-                # Use date format for date-based params, nanos int for timestamp
                 if base_param == "timestamp":
+                    # Nanosecond precision — exact gate time
                     params[lte_param] = int(
                         self.time_gate.timestamp() * self.time_mult(datetime_res)
                     )
+                elif base_param == "published_utc":
+                    # Accepts full UTC datetime — exact gate time
+                    params[lte_param] = safe_utc_datetime
                 else:
-                    params[lte_param] = self.time_gate.strftime("%Y-%m-%d")
+                    # Date-only — use previous day to avoid leakage
+                    params[lte_param] = safe_date
 
         return params
 
