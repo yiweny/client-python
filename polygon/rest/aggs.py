@@ -2,7 +2,7 @@ from .base import BaseClient
 from typing import Optional, Any, Dict, List, Union, Iterator, Tuple
 from .models import Agg, GroupedDailyAgg, DailyOpenCloseAgg, PreviousCloseAgg, Sort
 from urllib3 import HTTPResponse
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
 
 from .models.request import RequestOptionBuilder
 
@@ -130,13 +130,19 @@ class AggsClient(BaseClient):
         """
         Apply time gate to aggregate endpoint date parameters (from_, to).
         These are in the URL path, not query params.
+
+        When the value exceeds the gate, we ALWAYS return self.time_gate
+        as a datetime.  This preserves second-level precision so that
+        callers like list_aggs/get_aggs can convert to millisecond
+        timestamps for the URL (Polygon accepts both date strings and
+        ms timestamps).  Callers that need a date string (daily endpoints)
+        handle the conversion themselves.
         """
         if self.time_gate is None:
             return value
 
         # Convert to datetime for comparison
         value_dt = None
-        original_type = type(value)
 
         if isinstance(value, datetime):
             value_dt = value
@@ -144,9 +150,8 @@ class AggsClient(BaseClient):
             value_dt = datetime.combine(value, datetime.min.time())
         elif isinstance(value, int):
             # Unix milliseconds timestamp
-            value_dt = datetime.fromtimestamp(value / 1000)
+            value_dt = datetime.fromtimestamp(value / 1000, tz=timezone.utc).replace(tzinfo=None)
         elif isinstance(value, str):
-            # Try to parse as date string
             for fmt in ["%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%d"]:
                 try:
                     value_dt = datetime.strptime(value, fmt)
@@ -157,19 +162,10 @@ class AggsClient(BaseClient):
         if value_dt is None:
             return value
 
-        # Cap at time_gate
+        # Cap at time_gate — always return the gate as a datetime so
+        # downstream code can convert to the right precision.
         if value_dt > self.time_gate:
-            if original_type == datetime:
-                return self.time_gate
-            elif original_type == date:
-                return self.time_gate.date()
-            elif original_type == int:
-                return int(self.time_gate.timestamp() * 1000)
-            elif original_type == str:
-                if "T" in value:
-                    return self.time_gate.strftime("%Y-%m-%dT%H:%M:%S")
-                else:
-                    return self.time_gate.strftime("%Y-%m-%d")
+            return self.time_gate
 
         return value
 
@@ -330,8 +326,13 @@ class AggsClient(BaseClient):
         :param raw: Return raw object instead of results object
         :return: List of grouped daily aggregates
         """
-        # Apply time gate to date parameter
+        # Apply time gate. _apply_time_gate_to_agg_date returns a
+        # datetime when the requested date was capped (i.e. it was past
+        # the gate).  For this single-date endpoint, silently serving a
+        # different day's data would be misleading, so block instead.
         date = self._apply_time_gate_to_agg_date(date)
+        if self.time_gate is not None and isinstance(date, datetime):
+            return []
 
         # Force unadjusted data when time-gated.  Point-in-time split
         # adjustment is NOT applied here because grouped daily returns
@@ -370,8 +371,11 @@ class AggsClient(BaseClient):
         :param raw: Return raw object instead of results object
         :return: Daily open close aggregate
         """
-        # Apply time gate to date parameter
+        # Apply time gate.  If the requested date was past the gate,
+        # block — silently serving a different day's data is misleading.
         date = self._apply_time_gate_to_agg_date(date)
+        if self.time_gate is not None and isinstance(date, datetime):
+            return []
 
         # When time-gated and the caller wants adjusted data, we fetch
         # adjusted=true and rescale. Otherwise force adjusted=false.

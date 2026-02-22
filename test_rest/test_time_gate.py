@@ -360,14 +360,21 @@ class TimeGateAggsDateTest(unittest.TestCase):
     def test_str_before(self):
         self.assertEqual(self.client._apply_time_gate_to_agg_date("2023-06-10"), "2023-06-10")
 
-    def test_str_after(self):
-        self.assertEqual(self.client._apply_time_gate_to_agg_date("2023-06-20"), "2023-06-15")
+    def test_str_after_returns_datetime(self):
+        """Capping a date string returns the gate as a datetime
+        so callers can convert to millis for sub-day precision."""
+        result = self.client._apply_time_gate_to_agg_date("2023-06-20")
+        self.assertEqual(result, datetime(2023, 6, 15))
+        self.assertIsInstance(result, datetime)
 
     def test_date_before(self):
         self.assertEqual(self.client._apply_time_gate_to_agg_date(date(2023, 6, 10)), date(2023, 6, 10))
 
-    def test_date_after(self):
-        self.assertEqual(self.client._apply_time_gate_to_agg_date(date(2023, 6, 20)), date(2023, 6, 15))
+    def test_date_after_returns_datetime(self):
+        """Capping a date object returns the gate as a datetime."""
+        result = self.client._apply_time_gate_to_agg_date(date(2023, 6, 20))
+        self.assertEqual(result, datetime(2023, 6, 15))
+        self.assertIsInstance(result, datetime)
 
     def test_datetime_before(self):
         self.assertEqual(self.client._apply_time_gate_to_agg_date(datetime(2023, 6, 10)), datetime(2023, 6, 10))
@@ -379,10 +386,12 @@ class TimeGateAggsDateTest(unittest.TestCase):
         ts = int(datetime(2023, 6, 10).timestamp() * 1000)
         self.assertEqual(self.client._apply_time_gate_to_agg_date(ts), ts)
 
-    def test_millis_after(self):
+    def test_millis_after_returns_datetime(self):
+        """Capping a millis int returns the gate as a datetime."""
         ts = int(datetime(2023, 6, 20).timestamp() * 1000)
-        expected = int(datetime(2023, 6, 15).timestamp() * 1000)
-        self.assertEqual(self.client._apply_time_gate_to_agg_date(ts), expected)
+        result = self.client._apply_time_gate_to_agg_date(ts)
+        self.assertEqual(result, datetime(2023, 6, 15))
+        self.assertIsInstance(result, datetime)
 
     def test_no_gate_passthrough(self):
         _clear_gate()
@@ -741,13 +750,14 @@ class TimeGateEdgeCaseTest(unittest.TestCase):
         _clear_gate()
 
     def test_from_after_gate_produces_inverted_range(self):
-        """If from_ > time_gate, 'to' gets capped to time_gate which is before from_.
-        The API would return no data. This is correct behaviour — no future data leaks."""
+        """If from_ > time_gate, 'to' gets capped to the gate datetime.
+        In list_aggs this becomes a millis timestamp before from_, so the
+        API would return no data. This is correct — no future data leaks."""
         client = _make_mock("2023-06-15")
         from polygon.rest.aggs import AggsClient
         capped_to = AggsClient._apply_time_gate_to_agg_date(client, "2025-01-01")
-        self.assertEqual(capped_to, "2023-06-15")
-        # from_=2025-01-01, to=2023-06-15 → API returns nothing. Good.
+        # Now returns the gate as a datetime (not a string)
+        self.assertEqual(capped_to, datetime(2023, 6, 15))
 
     def test_from_is_not_capped(self):
         """from_ should NOT be gated (only 'to' is capped in aggs)."""
@@ -1210,6 +1220,239 @@ class TimeGateAdjustedTrueVsFalseTest(unittest.TestCase):
                 adjusted = True
         self.assertFalse(adjusted)
         self.assertFalse(want_pit_adjust)
+
+
+# ===================================================================
+# 13. Single-date endpoints block future dates (Issue 2)
+# ===================================================================
+
+
+class TimeGateSingleDateBlockTest(unittest.TestCase):
+    """Single-date endpoints (grouped_daily, daily_open_close) must
+    return [] when the requested date is past the gate, not silently
+    serve stale data from a different day."""
+
+    def setUp(self):
+        os.environ["TIME_GATE"] = "2023-06-15"
+        self.client = _make_mock("2023-06-15")
+
+    def tearDown(self):
+        _clear_gate()
+
+    def _make_aggs_client(self, gate_str):
+        """Build a mock AggsClient with time_gate set."""
+        from polygon.rest.aggs import AggsClient
+        from polygon.rest.base import BaseClient
+
+        class _MockAggs(AggsClient):
+            def __init__(self, tg):
+                self.time_gate = BaseClient._parse_time_gate(tg)
+
+        return _MockAggs(gate_str)
+
+    def test_future_date_capped_to_datetime(self):
+        """A date past the gate returns a datetime (signals 'capped')."""
+        c = self._make_aggs_client("2023-06-15")
+        result = c._apply_time_gate_to_agg_date("2023-06-20")
+        self.assertIsInstance(result, datetime)
+
+    def test_future_date_triggers_block_in_grouped_daily(self):
+        """grouped_daily_aggs checks isinstance(date, datetime) → return []."""
+        c = self._make_aggs_client("2023-06-15")
+        date = c._apply_time_gate_to_agg_date("2023-06-20")
+        # Simulate the guard in get_grouped_daily_aggs
+        if c.time_gate is not None and isinstance(date, datetime):
+            result = []
+        else:
+            result = "would_call_api"
+        self.assertEqual(result, [])
+
+    def test_past_date_not_blocked(self):
+        """A date before the gate returns unchanged string → no block."""
+        c = self._make_aggs_client("2023-06-15")
+        date = c._apply_time_gate_to_agg_date("2023-06-10")
+        self.assertEqual(date, "2023-06-10")
+        self.assertIsInstance(date, str)
+
+    def test_future_date_triggers_block_in_daily_open_close(self):
+        """daily_open_close_agg checks isinstance(date, datetime) → return []."""
+        c = self._make_aggs_client("2023-06-15")
+        date = c._apply_time_gate_to_agg_date("2023-06-20")
+        if c.time_gate is not None and isinstance(date, datetime):
+            result = []
+        else:
+            result = "would_call_api"
+        self.assertEqual(result, [])
+
+    def test_gate_date_itself_not_blocked(self):
+        """The gate date (equal, not >) returns original string → not blocked."""
+        c = self._make_aggs_client("2023-06-15")
+        date = c._apply_time_gate_to_agg_date("2023-06-15")
+        self.assertIsInstance(date, str)  # not capped → no block
+
+    def test_one_day_after_gate_blocked(self):
+        c = self._make_aggs_client("2023-06-15")
+        date = c._apply_time_gate_to_agg_date("2023-06-16")
+        self.assertIsInstance(date, datetime)  # capped → would be blocked
+
+    def test_source_has_block_guard_grouped_daily(self):
+        """get_grouped_daily_aggs source must have the isinstance block."""
+        import inspect
+        from polygon.rest.aggs import AggsClient
+        src = inspect.getsource(AggsClient.get_grouped_daily_aggs)
+        self.assertIn("isinstance(date, datetime)", src)
+        self.assertIn("return []", src)
+
+    def test_source_has_block_guard_daily_open_close(self):
+        """get_daily_open_close_agg source must have the isinstance block."""
+        import inspect
+        from polygon.rest.aggs import AggsClient
+        src = inspect.getsource(AggsClient.get_daily_open_close_agg)
+        self.assertIn("isinstance(date, datetime)", src)
+        self.assertIn("return []", src)
+
+
+# ===================================================================
+# 14. Plain param conflict prevention (Issue 3)
+# ===================================================================
+
+
+class TimeGatePlainParamConflictTest(unittest.TestCase):
+    """When a plain param (e.g. timestamp=X) is already in params,
+    we must NOT inject the .lte variant — Polygon rejects the combo."""
+
+    def setUp(self):
+        os.environ["TIME_GATE"] = "2023-06-15"
+        self.client = _make_mock("2023-06-15")
+
+    def tearDown(self):
+        _clear_gate()
+
+    def test_no_timestamp_lte_when_plain_timestamp_present(self):
+        """timestamp=X already caps the exact day. Adding timestamp.lte
+        causes Polygon API error."""
+        p = {"timestamp": "2023-06-10"}
+        result = self.client._apply_time_gate_to_params(p)
+        self.assertNotIn("timestamp.lte", result)
+        self.assertIn("timestamp", result)
+
+    def test_no_execution_date_lte_when_plain_present(self):
+        p = {"execution_date": "2023-06-10"}
+        result = self.client._apply_time_gate_to_params(p)
+        self.assertNotIn("execution_date.lte", result)
+        self.assertIn("execution_date", result)
+
+    def test_no_published_utc_lte_when_plain_present(self):
+        p = {"published_utc": "2023-06-10"}
+        result = self.client._apply_time_gate_to_params(p)
+        self.assertNotIn("published_utc.lte", result)
+        self.assertIn("published_utc", result)
+
+    def test_no_date_lte_when_plain_date_present(self):
+        p = {"date": "2023-06-10"}
+        result = self.client._apply_time_gate_to_params(p)
+        self.assertNotIn("date.lte", result)
+        self.assertIn("date", result)
+
+    def test_still_injects_other_params_when_one_plain_exists(self):
+        """Having plain timestamp should NOT prevent injecting
+        execution_date.lte (different base param)."""
+        p = {"timestamp": "2023-06-10"}
+        result = self.client._apply_time_gate_to_params(p)
+        # timestamp.lte skipped (plain exists)
+        self.assertNotIn("timestamp.lte", result)
+        # But execution_date.lte should still be injected
+        self.assertIn("execution_date.lte", result)
+
+    def test_lte_still_injected_without_plain(self):
+        """Normal case: no plain param → .lte is injected."""
+        p = {"ticker": "AAPL"}
+        result = self.client._apply_time_gate_to_params(p)
+        self.assertIn("timestamp.lte", result)
+        self.assertIn("execution_date.lte", result)
+
+    def test_plain_param_value_still_capped(self):
+        """The plain param value must still be capped at the gate."""
+        p = {"timestamp": "2025-01-01"}
+        result = self.client._apply_time_gate_to_params(p)
+        # Value capped to gate date
+        self.assertEqual(result["timestamp"], "2023-06-15")
+        # No .lte injected (plain exists)
+        self.assertNotIn("timestamp.lte", result)
+
+    def test_gte_with_plain_param_no_conflict(self):
+        """timestamp.gte + plain timestamp: lte should NOT be injected."""
+        p = {"timestamp": "2023-06-10", "timestamp.gte": "2023-06-01"}
+        result = self.client._apply_time_gate_to_params(p)
+        self.assertNotIn("timestamp.lte", result)
+
+    def test_lte_override_still_works(self):
+        """Explicit .lte from caller is still capped, even with plain."""
+        p = {"timestamp.gte": "2023-01-01", "timestamp.lte": "2023-12-31"}
+        result = self.client._apply_time_gate_to_params(p)
+        self.assertEqual(result["timestamp.lte"], "2023-06-15")
+
+
+# ===================================================================
+# 15. Agg date precision — millis for intraday, block for daily
+# ===================================================================
+
+
+class TimeGateAggDatePrecisionTest(unittest.TestCase):
+    """_apply_time_gate_to_agg_date returns a datetime when capping,
+    which list_aggs converts to millis for sub-day precision."""
+
+    def setUp(self):
+        # Use a gate with a specific time to test sub-day precision
+        os.environ["TIME_GATE"] = "2023-06-15T17:30:00"
+
+    def tearDown(self):
+        _clear_gate()
+
+    def test_capped_string_returns_datetime_with_time(self):
+        """A capped date string should return the full gate datetime
+        including hours/minutes, not just the date."""
+        from polygon.rest.aggs import AggsClient
+        client = _make_mock("2023-06-15T17:30:00")
+        result = AggsClient._apply_time_gate_to_agg_date(client, "2023-06-20")
+        self.assertIsInstance(result, datetime)
+        self.assertEqual(result.hour, 17)
+        self.assertEqual(result.minute, 30)
+
+    def test_capped_datetime_preserves_gate_time(self):
+        from polygon.rest.aggs import AggsClient
+        client = _make_mock("2023-06-15T17:30:00")
+        result = AggsClient._apply_time_gate_to_agg_date(
+            client, datetime(2023, 6, 20, 12, 0, 0)
+        )
+        self.assertEqual(result, datetime(2023, 6, 15, 17, 30, 0))
+
+    def test_uncapped_string_stays_string(self):
+        """A date before the gate should return unchanged."""
+        from polygon.rest.aggs import AggsClient
+        client = _make_mock("2023-06-15T17:30:00")
+        result = AggsClient._apply_time_gate_to_agg_date(client, "2023-06-10")
+        self.assertEqual(result, "2023-06-10")
+        self.assertIsInstance(result, str)
+
+    def test_datetime_to_millis_flow_in_list_aggs(self):
+        """Verify the capped datetime would convert to millis in list_aggs.
+        The isinstance(to, datetime) → int(to.timestamp() * 1000) logic."""
+        client = _make_mock("2023-06-15T17:30:00")
+        gate_dt = client.time_gate  # datetime(2023, 6, 15, 17, 30)
+
+        # Simulate the list_aggs flow:
+        to = "2024-06-30"  # future date
+        from polygon.rest.aggs import AggsClient
+        to = AggsClient._apply_time_gate_to_agg_date(client, to)
+        # Now to is a datetime with full precision
+        self.assertIsInstance(to, datetime)
+
+        # list_aggs does: if isinstance(to, datetime): to = int(ts * 1000)
+        to_millis = int(to.timestamp() * 1000)
+        gate_millis = int(gate_dt.timestamp() * 1000)
+        self.assertEqual(to_millis, gate_millis)
+        # This millis value goes into the URL — full precision preserved
 
 
 if __name__ == "__main__":

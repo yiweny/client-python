@@ -351,7 +351,16 @@ class BaseClient:
             lte_param = f"{base_param}.lte"
             lt_param = f"{base_param}.lt"
 
-            if lte_param not in params and lt_param not in params:
+            # Skip injection when the plain param already exists — the
+            # Polygon API rejects having both an exact value (e.g.
+            # timestamp=2024-06-20) and a range bound (timestamp.lte=...)
+            # at the same time.  The plain value is already capped by the
+            # plain-param capping code above, so gating is still enforced.
+            if (
+                lte_param not in params
+                and lt_param not in params
+                and base_param not in params
+            ):
                 if base_param == "timestamp":
                     # Nanosecond precision — exact gate time
                     params[lte_param] = int(
