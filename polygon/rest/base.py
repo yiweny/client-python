@@ -216,21 +216,24 @@ class BaseClient:
         if self.time_gate is None or value is None:
             return value
 
-        # Convert value to datetime for comparison
+        # Date-only values use EOD (23:59:59) for comparison since
+        # Polygon treats date strings as covering the full day.
         value_dt = None
         if isinstance(value, datetime):
             value_dt = value
         elif isinstance(value, date):
-            value_dt = datetime.combine(value, datetime.min.time())
+            value_dt = datetime.combine(value, datetime.min.time()).replace(
+                hour=23, minute=59, second=59
+            )
         elif isinstance(value, int):
-            # Assume it's a Unix timestamp, normalize to seconds
             divisor = self.time_mult(datetime_res)
             value_dt = datetime.fromtimestamp(value / divisor)
         elif isinstance(value, str):
-            # Try to parse as date string
             for fmt in ["%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%d"]:
                 try:
                     value_dt = datetime.strptime(value, fmt)
+                    if fmt == "%Y-%m-%d":
+                        value_dt = value_dt.replace(hour=23, minute=59, second=59)
                     break
                 except ValueError:
                     continue
@@ -331,17 +334,9 @@ class BaseClient:
                     params[param], datetime_res
                 )
 
-        # For each base param, always inject an upper bound (.lte) if none
-        # exists. This ensures the time gate is enforced even when the caller
-        # omits date filters entirely (e.g. list_splits(ticker="AAPL")
-        # without an execution_date filter).
-        #
-        # Three precision levels depending on what the Polygon API accepts:
-        #   - timestamp:     nanosecond UTC int  (exact, no rounding)
-        #   - published_utc: ISO-8601 datetime   (exact, no rounding)
-        #   - all others:    YYYY-MM-DD date-only (API rejects datetimes,
-        #                    so we round DOWN to the previous day to avoid
-        #                    leaking events later in the gate date)
+        # Inject .lte upper bounds for all date params.
+        # Precision: timestamp → nanos int, published_utc → ISO datetime,
+        # all others → YYYY-MM-DD (gate_date - 1 day, API is date-only).
         safe_date = (self.time_gate.date() - timedelta(days=1)).strftime(
             "%Y-%m-%d"
         )
@@ -351,11 +346,8 @@ class BaseClient:
             lte_param = f"{base_param}.lte"
             lt_param = f"{base_param}.lt"
 
-            # Skip injection when the plain param already exists — the
-            # Polygon API rejects having both an exact value (e.g.
-            # timestamp=2024-06-20) and a range bound (timestamp.lte=...)
-            # at the same time.  The plain value is already capped by the
-            # plain-param capping code above, so gating is still enforced.
+            # Skip if plain param exists (Polygon rejects exact + range
+            # combo; the plain value is already capped above).
             if (
                 lte_param not in params
                 and lt_param not in params

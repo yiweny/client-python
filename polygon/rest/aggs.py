@@ -9,41 +9,21 @@ from .models.request import RequestOptionBuilder
 
 class AggsClient(BaseClient):
     # ------------------------------------------------------------------
-    # Point-in-time adjustment via ratio rescaling
-    #
-    # Polygon's adjusted=true reflects ALL splits & dividends up to today.
-    # To get "point-in-time adjusted" prices (only events known at the
-    # gate date), we:
-    #   1. Fetch fully-adjusted prices from the API (adjusted=true).
-    #   2. Fetch ONE reference bar at the gate date, both adjusted and
-    #      unadjusted, to compute a gate_ratio.
-    #   3. Divide all adjusted prices by gate_ratio.
-    #
-    # gate_ratio captures every post-gate adjustment (splits + dividends).
-    # Dividing it out leaves only pre-gate adjustments — exactly what a
-    # person querying on the gate date would have seen.
+    # Point-in-time adjustment: fetch adjusted + unadjusted at the gate
+    # date, compute gate_ratio = adj/unadj, divide out post-gate events.
     # ------------------------------------------------------------------
 
     def _compute_gate_adjustment_ratio(
         self, ticker: str
     ) -> Tuple[float, float]:
-        """
-        Return (price_ratio, volume_ratio) at the gate date.
-
-        price_ratio  = adjusted_close / unadjusted_close
-        volume_ratio = adjusted_volume / unadjusted_volume
-
-        Dividing Polygon's fully-adjusted values by these ratios removes
-        every post-gate adjustment (splits + dividends).
-
-        Returns (1.0, 1.0) when no rescaling is needed.
-        """
+        """Return (price_ratio, volume_ratio) at the gate date.
+        Dividing fully-adjusted values by these removes post-gate
+        adjustments (splits + dividends). Returns (1.0, 1.0) on failure."""
         if self.time_gate is None:
             return (1.0, 1.0)
 
         gate_date = self.time_gate.strftime("%Y-%m-%d")
-        # Look back up to 10 days to find a trading day at/before the gate
-        from_dt = self.time_gate - timedelta(days=10)
+        from_dt = self.time_gate - timedelta(days=10)  # cover weekends/holidays
         from_date = from_dt.strftime("%Y-%m-%d")
         path = f"/v2/aggs/ticker/{ticker}/range/1/day/{from_date}/{gate_date}"
 
@@ -127,34 +107,31 @@ class AggsClient(BaseClient):
     def _apply_time_gate_to_agg_date(
         self, value: Union[str, int, datetime, date]
     ) -> Union[str, int, datetime, date]:
-        """
-        Apply time gate to aggregate endpoint date parameters (from_, to).
-        These are in the URL path, not query params.
-
-        When the value exceeds the gate, we ALWAYS return self.time_gate
-        as a datetime.  This preserves second-level precision so that
-        callers like list_aggs/get_aggs can convert to millisecond
-        timestamps for the URL (Polygon accepts both date strings and
-        ms timestamps).  Callers that need a date string (daily endpoints)
-        handle the conversion themselves.
-        """
+        """Cap agg URL-path dates (from_, to) at the gate.
+        Returns self.time_gate (datetime) when capped, preserving
+        sub-day precision for millis conversion in list_aggs/get_aggs.
+        Date-only inputs use EOD (23:59:59) for comparison since Polygon
+        treats them as covering the full day."""
         if self.time_gate is None:
             return value
 
-        # Convert to datetime for comparison
         value_dt = None
-
         if isinstance(value, datetime):
             value_dt = value
         elif isinstance(value, date):
-            value_dt = datetime.combine(value, datetime.min.time())
+            # date → EOD for comparison (Polygon includes full day)
+            value_dt = datetime.combine(value, datetime.min.time()).replace(
+                hour=23, minute=59, second=59
+            )
         elif isinstance(value, int):
-            # Unix milliseconds timestamp
             value_dt = datetime.fromtimestamp(value / 1000, tz=timezone.utc).replace(tzinfo=None)
         elif isinstance(value, str):
             for fmt in ["%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%d"]:
                 try:
                     value_dt = datetime.strptime(value, fmt)
+                    if fmt == "%Y-%m-%d":
+                        # Date-only → EOD for comparison
+                        value_dt = value_dt.replace(hour=23, minute=59, second=59)
                     break
                 except ValueError:
                     continue
@@ -162,8 +139,6 @@ class AggsClient(BaseClient):
         if value_dt is None:
             return value
 
-        # Cap at time_gate — always return the gate as a datetime so
-        # downstream code can convert to the right precision.
         if value_dt > self.time_gate:
             return self.time_gate
 
@@ -199,20 +174,16 @@ class AggsClient(BaseClient):
         :param raw: Return raw object instead of results object
         :return: Iterator of aggregates
         """
-        # Apply time gate to 'to' parameter
         to = self._apply_time_gate_to_agg_date(to)
 
-        # When time-gated and the caller wants adjusted data, we fetch
-        # adjusted=true from Polygon (which adjusts for ALL events up to
-        # today) and then rescale to remove post-gate adjustments.
-        # When the caller wants unadjusted, we just force adjusted=false.
+        # PIT adjustment: fetch adjusted=true, rescale to remove post-gate events.
         want_pit_adjust = False
         if self.time_gate is not None:
             if adjusted is False:
-                pass  # caller explicitly wants raw — leave as-is
+                pass
             else:
                 want_pit_adjust = True
-                adjusted = True  # fetch fully-adjusted from API
+                adjusted = True
 
         if isinstance(from_, datetime):
             from_ = int(from_.timestamp() * self.time_mult("millis"))
@@ -266,12 +237,9 @@ class AggsClient(BaseClient):
         :param raw: Return raw object instead of results object
         :return: List of aggregates
         """
-        # Apply time gate to 'to' parameter
         to = self._apply_time_gate_to_agg_date(to)
 
-        # When time-gated and the caller wants adjusted data, we fetch
-        # adjusted=true from Polygon and then rescale to remove post-gate
-        # adjustments. When the caller wants unadjusted, force adjusted=false.
+        # PIT adjustment: fetch adjusted=true, rescale to remove post-gate events.
         want_pit_adjust = False
         if self.time_gate is not None:
             if adjusted is False:
@@ -326,18 +294,12 @@ class AggsClient(BaseClient):
         :param raw: Return raw object instead of results object
         :return: List of grouped daily aggregates
         """
-        # Apply time gate. _apply_time_gate_to_agg_date returns a
-        # datetime when the requested date was capped (i.e. it was past
-        # the gate).  For this single-date endpoint, silently serving a
-        # different day's data would be misleading, so block instead.
+        # Block if date is past the gate (capped → returns datetime).
         date = self._apply_time_gate_to_agg_date(date)
         if self.time_gate is not None and isinstance(date, datetime):
             return []
 
-        # Force unadjusted data when time-gated.  Point-in-time split
-        # adjustment is NOT applied here because grouped daily returns
-        # data for the entire market (thousands of tickers) and fetching
-        # splits for each would be impractical.
+        # Force unadjusted (PIT not feasible for all-market endpoint).
         if self.time_gate is not None:
             adjusted = False
 
@@ -371,14 +333,12 @@ class AggsClient(BaseClient):
         :param raw: Return raw object instead of results object
         :return: Daily open close aggregate
         """
-        # Apply time gate.  If the requested date was past the gate,
-        # block — silently serving a different day's data is misleading.
+        # Block if date is past the gate (capped → returns datetime).
         date = self._apply_time_gate_to_agg_date(date)
         if self.time_gate is not None and isinstance(date, datetime):
             return []
 
-        # When time-gated and the caller wants adjusted data, we fetch
-        # adjusted=true and rescale. Otherwise force adjusted=false.
+        # PIT adjustment: fetch adjusted=true, rescale to remove post-gate events.
         want_pit_adjust = False
         if self.time_gate is not None:
             if adjusted is False:

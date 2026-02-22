@@ -1284,11 +1284,21 @@ class TimeGateSingleDateBlockTest(unittest.TestCase):
             result = "would_call_api"
         self.assertEqual(result, [])
 
-    def test_gate_date_itself_not_blocked(self):
-        """The gate date (equal, not >) returns original string → not blocked."""
+    def test_gate_date_itself_blocked(self):
+        """The gate date as a string is treated as end-of-day (23:59:59).
+        Since the gate is at midnight and EOD > midnight, it IS capped.
+        For single-date endpoints this means the gate date is blocked —
+        correct, since the full day's data (including EOD) would leak."""
         c = self._make_aggs_client("2023-06-15")
         date = c._apply_time_gate_to_agg_date("2023-06-15")
-        self.assertIsInstance(date, str)  # not capped → no block
+        self.assertIsInstance(date, datetime)  # capped → would be blocked
+
+    def test_gate_date_not_blocked_when_gate_is_eod(self):
+        """If the gate is at 23:59:59, the gate date's EOD equals the
+        gate time exactly (not >) → not capped → allowed."""
+        c = self._make_aggs_client("2023-06-15T23:59:59")
+        date = c._apply_time_gate_to_agg_date("2023-06-15")
+        self.assertIsInstance(date, str)  # not capped
 
     def test_one_day_after_gate_blocked(self):
         c = self._make_aggs_client("2023-06-15")
