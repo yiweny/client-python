@@ -291,8 +291,7 @@ class BaseClient:
             "declaration_date.lt",
             "pay_date.lte",
             "pay_date.lt",
-            "expiration_date.lte",
-            "expiration_date.lt",
+            # expiration_date excluded (contract-property, not data timestamp)
             "settlement_date.lte",
             "settlement_date.lt",
             "date.lte",
@@ -312,7 +311,7 @@ class BaseClient:
             "record_date",
             "declaration_date",
             "pay_date",
-            "expiration_date",
+            # expiration_date excluded (contract-property, not data timestamp)
             "settlement_date",
             "date",
             "listing_date",
@@ -341,6 +340,14 @@ class BaseClient:
             "%Y-%m-%d"
         )
         safe_utc_datetime = self.time_gate.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        # Inject as_of when missing (API defaults to today).
+        # Treat None/empty string the same as missing.
+        # Use safe_date (gate - 1 day), not gate_date, because direct Polygon
+        # queries showed option contract sets can change intraday and a newly
+        # appearing contract can first quote after 1pm ET on the gate day.
+        if not params.get("as_of"):
+            params["as_of"] = safe_date
 
         for base_param in timestamp_base_params:
             lte_param = f"{base_param}.lte"

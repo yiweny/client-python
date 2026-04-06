@@ -227,9 +227,15 @@ class TimeGateParamsApplicationTest(unittest.TestCase):
         p = {"ex_dividend_date.gte": "2023-01-01", "ex_dividend_date.lte": "2023-12-31"}
         self.assertEqual(self.client._apply_time_gate_to_params(p)["ex_dividend_date.lte"], "2023-06-15")
 
-    def test_caps_expiration_date_lte(self):
+    def test_expiration_date_not_capped(self):
+        """expiration_date is a contract-property filter, not a data timestamp.
+        It must NOT be capped so the model can look up contracts expiring
+        after the gate date (e.g. for implied volatility analysis)."""
         p = {"expiration_date.gte": "2023-01-01", "expiration_date.lte": "2023-12-31"}
-        self.assertEqual(self.client._apply_time_gate_to_params(p)["expiration_date.lte"], "2023-06-15")
+        result = self.client._apply_time_gate_to_params(p)
+        # expiration_date.lte should pass through unchanged
+        self.assertEqual(result["expiration_date.lte"], "2023-12-31")
+        self.assertEqual(result["expiration_date.gte"], "2023-01-01")
 
     def test_caps_listing_date_lte(self):
         p = {"listing_date.gte": "2023-01-01", "listing_date.lte": "2023-12-31"}
@@ -283,10 +289,12 @@ class TimeGateParamsApplicationTest(unittest.TestCase):
         result = self.client._apply_time_gate_to_params(p)
         self.assertIn("settlement_date.lte", result)
 
-    def test_always_injects_expiration_date_lte(self):
+    def test_does_not_inject_expiration_date_lte(self):
+        """expiration_date is excluded from auto-injection because it is a
+        contract-property filter, not a data timestamp."""
         p = {}
         result = self.client._apply_time_gate_to_params(p)
-        self.assertIn("expiration_date.lte", result)
+        self.assertNotIn("expiration_date.lte", result)
 
     # -- cap plain date params --
     def test_caps_plain_date_param(self):
@@ -317,6 +325,37 @@ class TimeGateParamsApplicationTest(unittest.TestCase):
         result = self.client._apply_time_gate_to_params(p)
         self.assertEqual(result["published_utc"], "2023-06-15")
 
+    # -- as_of auto-injection --
+    def test_injects_as_of_when_missing(self):
+        """as_of must be auto-injected so endpoints like list_options_contracts
+        don't default to 'today' and leak post-gate contract metadata."""
+        p = {}
+        result = self.client._apply_time_gate_to_params(p)
+        self.assertIn("as_of", result)
+        # Injected as_of uses safe_date to avoid same-day intraday leakage.
+        self.assertEqual(result["as_of"], "2023-06-14")
+
+    def test_injects_as_of_with_unrelated_params(self):
+        """as_of should be injected even when other params are present."""
+        p = {"underlying_ticker": "AAPL", "expiration_date.lte": "2025-12-31"}
+        result = self.client._apply_time_gate_to_params(p)
+        self.assertEqual(result["as_of"], "2023-06-14")
+        # expiration_date.lte should still pass through uncapped
+        self.assertEqual(result["expiration_date.lte"], "2025-12-31")
+
+    def test_does_not_overwrite_caller_as_of(self):
+        """If caller already provided as_of, it should be capped, not replaced."""
+        p = {"as_of": "2023-03-01"}
+        result = self.client._apply_time_gate_to_params(p)
+        # Caller's value is before gate — should pass through unchanged
+        self.assertEqual(result["as_of"], "2023-03-01")
+
+    def test_caps_caller_as_of_after_gate(self):
+        """If caller provided as_of after gate, it should be capped."""
+        p = {"as_of": "2025-01-01"}
+        result = self.client._apply_time_gate_to_params(p)
+        self.assertEqual(result["as_of"], "2023-06-15")
+
 
 # ===================================================================
 # 4. No gate  → everything passes through unchanged
@@ -337,6 +376,11 @@ class TimeGateNoGateTest(unittest.TestCase):
     def test_no_timestamp_lte_injected(self):
         p = {"ticker": "AAPL"}
         self.assertNotIn("timestamp.lte", self.client._apply_time_gate_to_params(p.copy()))
+
+    def test_no_as_of_injected(self):
+        """Without gate, as_of should not be auto-injected."""
+        p = {"ticker": "AAPL"}
+        self.assertNotIn("as_of", self.client._apply_time_gate_to_params(p.copy()))
 
 
 # ===================================================================
@@ -1385,7 +1429,6 @@ class TimeGatePlainParamConflictTest(unittest.TestCase):
         """The plain param value must still be capped at the gate."""
         p = {"timestamp": "2025-01-01"}
         result = self.client._apply_time_gate_to_params(p)
-        # Value capped to gate date
         self.assertEqual(result["timestamp"], "2023-06-15")
         # No .lte injected (plain exists)
         self.assertNotIn("timestamp.lte", result)
@@ -1463,6 +1506,287 @@ class TimeGateAggDatePrecisionTest(unittest.TestCase):
         gate_millis = int(gate_dt.timestamp() * 1000)
         self.assertEqual(to_millis, gate_millis)
         # This millis value goes into the URL — full precision preserved
+
+
+# ===================================================================
+# 16. as_of auto-injection for options contracts endpoints
+# ===================================================================
+
+
+def _make_contracts_mock(gate_str):
+    """Build a mock that has time_gate + the _get_params machinery
+    needed by ContractsClient methods."""
+    from polygon.rest.base import BaseClient
+
+    class _Mock(BaseClient):
+        def __init__(self, tg):
+            self.time_gate = self._parse_time_gate(tg)
+
+    return _Mock(gate_str)
+
+
+class TimeGateAsOfInjectionTest(unittest.TestCase):
+    """as_of must be auto-injected to the gate date so that
+    list_options_contracts (which defaults to as_of=today when omitted)
+    doesn't leak post-gate contract metadata.
+
+    Evidence from direct Polygon queries and docs:
+    - date/as_of style params are point-in-time daily snapshots
+    - range upper bounds (.lte/.lt and agg to/date URL params) are inclusive
+      for the whole day, so injected bounds must use safe_date = gate - 1 day
+    """
+
+    def setUp(self):
+        os.environ["TIME_GATE"] = "2023-06-15"
+        self.client = _make_contracts_mock("2023-06-15")
+
+    def tearDown(self):
+        _clear_gate()
+
+    # ----- helpers -----
+    def _simulate_list_contracts_params(self, **kwargs):
+        """Run _get_params exactly as list_options_contracts would."""
+        import inspect
+        from polygon.rest.reference import ContractsClient
+
+        fn = ContractsClient.list_options_contracts
+        params = kwargs.pop("params", None) or {}
+
+        for argname, v in inspect.signature(fn).parameters.items():
+            if argname in ["self", "params", "raw", "options"]:
+                continue
+            if v.default != v.empty:
+                val = kwargs.get(argname, v.default)
+                if isinstance(val, bool):
+                    val = str(val).lower()
+                if val is not None:
+                    for ext in ["lt", "lte", "gt", "gte", "any_of"]:
+                        if argname.endswith(f"_{ext}"):
+                            argname = argname[: -len(f"_{ext}")] + f".{ext}"
+                            break
+                    params[argname] = val
+
+        return self.client._apply_time_gate_to_params(params)
+
+    def _simulate_get_contract_params(self, **kwargs):
+        """Run _get_params exactly as get_options_contract would."""
+        import inspect
+        from polygon.rest.reference import ContractsClient
+
+        fn = ContractsClient.get_options_contract
+        params = kwargs.pop("params", None) or {}
+
+        for argname, v in inspect.signature(fn).parameters.items():
+            if argname in ["self", "params", "raw", "options"]:
+                continue
+            if v.default != v.empty:
+                val = kwargs.get(argname, v.default)
+                if val is not None:
+                    params[argname] = val
+
+        return self.client._apply_time_gate_to_params(params)
+
+    # ----- list_options_contracts -----
+    def test_as_of_injected_when_not_provided(self):
+        """Caller omits as_of → must be injected to gate - 1 day."""
+        result = self._simulate_list_contracts_params(
+            underlying_ticker="MNST",
+            expiration_date_gte="2025-12-27",
+            expiration_date_lte="2026-01-10",
+            limit=100,
+        )
+        self.assertEqual(result["as_of"], "2023-06-14")
+
+    def test_expiration_date_uncapped_with_as_of_injected(self):
+        """expiration_date filters must pass through uncapped even when
+        as_of is injected."""
+        result = self._simulate_list_contracts_params(
+            underlying_ticker="MNST",
+            expiration_date_gte="2025-12-27",
+            expiration_date_lte="2026-01-10",
+        )
+        self.assertEqual(result["expiration_date.gte"], "2025-12-27")
+        self.assertEqual(result["expiration_date.lte"], "2026-01-10")
+        self.assertEqual(result["as_of"], "2023-06-14")
+
+    def test_caller_as_of_before_gate_preserved(self):
+        """Caller provides as_of before the gate → value preserved."""
+        result = self._simulate_list_contracts_params(
+            underlying_ticker="AAPL",
+            as_of="2023-03-01",
+        )
+        self.assertEqual(result["as_of"], "2023-03-01")
+
+    def test_caller_as_of_after_gate_capped(self):
+        """Caller provides as_of after the gate → capped."""
+        result = self._simulate_list_contracts_params(
+            underlying_ticker="AAPL",
+            as_of="2025-01-01",
+        )
+        self.assertEqual(result["as_of"], "2023-06-15")
+
+    def test_contract_type_and_expired_pass_through(self):
+        """Non-date params must pass through unchanged."""
+        result = self._simulate_list_contracts_params(
+            underlying_ticker="MNST",
+            contract_type="call",
+            expiration_date_gte="2025-12-26",
+            expiration_date_lte="2026-01-20",
+            expired=False,
+        )
+        self.assertEqual(result["contract_type"], "call")
+        self.assertEqual(result["expired"], "false")
+        self.assertEqual(result["underlying_ticker"], "MNST")
+
+    def test_rollout_000007_scenario(self):
+        """Exact Rollout 000007 call: as_of injected, expiration uncapped."""
+        result = self._simulate_list_contracts_params(
+            underlying_ticker="MNST",
+            expiration_date_gte="2025-12-27",
+            expiration_date_lte="2026-01-10",
+            limit=100,
+        )
+        self.assertEqual(result["as_of"], "2023-06-14")
+        self.assertEqual(result["expiration_date.gte"], "2025-12-27")
+        self.assertEqual(result["expiration_date.lte"], "2026-01-10")
+        self.assertEqual(result["limit"], 100)
+
+    def test_rollout_000013_scenario(self):
+        """Exact Rollout 000013 call."""
+        result = self._simulate_list_contracts_params(
+            underlying_ticker="MNST",
+            contract_type="call",
+            expiration_date_gte="2025-12-26",
+            expiration_date_lte="2025-12-31",
+            limit=50,
+        )
+        self.assertEqual(result["as_of"], "2023-06-14")
+        self.assertEqual(result["expiration_date.gte"], "2025-12-26")
+        self.assertEqual(result["expiration_date.lte"], "2025-12-31")
+
+    def test_rollout_000090_scenario(self):
+        """Exact Rollout 000090 call."""
+        result = self._simulate_list_contracts_params(
+            underlying_ticker="MNST",
+            expiration_date_gte="2025-12-26",
+            expiration_date_lte="2026-01-20",
+            contract_type="call",
+            expired=False,
+        )
+        self.assertEqual(result["as_of"], "2023-06-14")
+        self.assertEqual(result["expiration_date.gte"], "2025-12-26")
+        self.assertEqual(result["expiration_date.lte"], "2026-01-20")
+
+    # ----- get_options_contract (singular) -----
+    def test_get_contract_as_of_injected(self):
+        """get_options_contract with no as_of → injected at gate - 1 day."""
+        result = self._simulate_get_contract_params(
+            ticker="O:MNST261218C00055000",
+        )
+        self.assertEqual(result["as_of"], "2023-06-14")
+
+    def test_get_contract_as_of_capped(self):
+        """get_options_contract with as_of after gate → capped."""
+        result = self._simulate_get_contract_params(
+            ticker="O:MNST261218C00055000",
+            as_of="2025-09-01",
+        )
+        self.assertEqual(result["as_of"], "2023-06-15")
+
+    def test_get_contract_as_of_before_gate_preserved(self):
+        """get_options_contract with as_of before gate → preserved."""
+        result = self._simulate_get_contract_params(
+            ticker="O:MNST261218C00055000",
+            as_of="2023-01-15",
+        )
+        self.assertEqual(result["as_of"], "2023-01-15")
+
+    # ----- no gate -----
+    def test_no_gate_as_of_not_injected(self):
+        """Without time gate, as_of should NOT be injected."""
+        _clear_gate()
+        client = _make_contracts_mock(None)
+        p = {"underlying_ticker": "AAPL", "expiration_date.lte": "2026-01-10"}
+        result = client._apply_time_gate_to_params(p)
+        self.assertNotIn("as_of", result)
+
+    def test_caller_as_of_none_injects_gate_date(self):
+        result = self._simulate_list_contracts_params(
+            underlying_ticker="AAPL",
+            as_of=None,
+        )
+        self.assertEqual(result["as_of"], "2023-06-14")
+
+    def test_caller_as_of_empty_injects_gate_date(self):
+        result = self._simulate_list_contracts_params(
+            underlying_ticker="AAPL",
+            params={"as_of": ""},
+        )
+        self.assertEqual(result["as_of"], "2023-06-14")
+
+    def test_no_gate_expiration_date_unchanged(self):
+        """Without time gate, expiration_date passes through."""
+        _clear_gate()
+        client = _make_contracts_mock(None)
+        p = {
+            "underlying_ticker": "AAPL",
+            "expiration_date.gte": "2025-12-27",
+            "expiration_date.lte": "2026-01-10",
+        }
+        result = client._apply_time_gate_to_params(p.copy())
+        self.assertEqual(result["expiration_date.gte"], "2025-12-27")
+        self.assertEqual(result["expiration_date.lte"], "2026-01-10")
+
+    # ----- verify the noise params don't break anything -----
+    def test_irrelevant_params_injected_but_harmless(self):
+        """The blanket injection adds params the contracts endpoint ignores.
+        Verify they exist but don't interfere with the real params."""
+        result = self._simulate_list_contracts_params(
+            underlying_ticker="MNST",
+            expiration_date_lte="2026-01-10",
+        )
+        # Real params intact
+        self.assertEqual(result["underlying_ticker"], "MNST")
+        self.assertEqual(result["expiration_date.lte"], "2026-01-10")
+        self.assertEqual(result["as_of"], "2023-06-14")
+        # Noise params present (Polygon ignores these on contracts endpoint)
+        self.assertIn("timestamp.lte", result)
+        self.assertIn("filing_date.lte", result)
+        self.assertIn("execution_date.lte", result)
+        # expiration_date.lte is NOT overwritten by the noise injection
+        self.assertNotEqual(result["expiration_date.lte"], "2023-06-14")
+
+    def test_date_snapshot_param_uses_gate_date_not_safe_date(self):
+        """Injected as_of now uses safe_date to avoid same-day intraday leaks
+        from contract additions."""
+        result = self._simulate_list_contracts_params(underlying_ticker="AAPL")
+        self.assertEqual(result["as_of"], "2023-06-14")
+
+    def test_range_upper_bounds_still_use_safe_date(self):
+        """Range upper bounds remain on safe_date because date-only .lte/.lt
+        semantics include the full day."""
+        result = self.client._apply_time_gate_to_params({"ticker": "AAPL"})
+        self.assertEqual(result["date.lte"], "2023-06-14")
+        self.assertEqual(result["execution_date.lte"], "2023-06-14")
+        self.assertEqual(result["filing_date.lte"], "2023-06-14")
+        self.assertEqual(result["timestamp.lte"], int(datetime(2023, 6, 15).timestamp() * 1_000_000_000))
+
+    def test_plain_as_of_after_gate_caps_to_gate_date(self):
+        """Caller-provided point-in-time params cap to the gate date itself,
+        not safe_date."""
+        result = self._simulate_list_contracts_params(
+            underlying_ticker="AAPL",
+            as_of="2025-01-01",
+        )
+        self.assertEqual(result["as_of"], "2023-06-15")
+        self.assertNotEqual(result["as_of"], "2023-06-14")
+
+    def test_plain_date_param_after_gate_caps_to_gate_date(self):
+        """Plain exact date params are capped to gate date; only injected
+        range upper bounds use safe_date."""
+        result = self.client._apply_time_gate_to_params({"date": "2025-01-01"})
+        self.assertEqual(result["date"], "2023-06-15")
+        self.assertNotEqual(result["date"], "2023-06-14")
 
 
 if __name__ == "__main__":
